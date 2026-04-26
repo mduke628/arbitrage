@@ -10,7 +10,7 @@ import json
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +53,19 @@ class ArbOpportunity:
         return d
 
 
+@dataclass(frozen=True)
+class CrossMarketMapping:
+    sportsbook_event_contains: str
+    sportsbook_outcome_contains: str
+    kalshi_ticker: str
+    kalshi_leg: str
+
+
 # ---------------------------------------------------------------------------
 # Odds utilities
 # ---------------------------------------------------------------------------
 
 def decimal_to_american(dec: float) -> str:
-    if dec <= 1.0:
-        return "N/A"
     if dec >= 2.0:
         return f"+{round((dec - 1) * 100)}"
     return str(round(-100 / (dec - 1)))
@@ -70,8 +76,6 @@ def american_to_decimal(american: float) -> float:
     return (100 / abs(american)) + 1
 
 def implied_prob(decimal_odds: float) -> float:
-    if decimal_odds <= 0:
-        return 1.0
     return 1 / decimal_odds
 
 
@@ -274,6 +278,8 @@ async def fetch_sport_events(session: aiohttp.ClientSession, api_key: str, sport
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status in (401, 422):
                 return []
+            if resp.status == 429:
+                return [{"_quota_limited": True}]
             if resp.status != 200:
                 print(f"  [props] {sport} events: HTTP {resp.status}")
                 return []
@@ -307,18 +313,6 @@ async def fetch_event_player_props(
         return None
 
 
-def _is_today_upcoming(commence_time_str: str) -> bool:
-    """Return True if the event hasn't started yet and begins within the next 24 hours."""
-    if not commence_time_str:
-        return True  # no time info — keep it
-    try:
-        ct = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        return now < ct < now + timedelta(hours=24)
-    except Exception:
-        return True  # malformed timestamp — keep it
-
-
 def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
     """
     Parse a per-event odds response that contains player prop markets.
@@ -331,24 +325,16 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
     sport = event_data.get("sport_key", "")
     commence_time = event_data.get("commence_time", "")
 
-    if not _is_today_upcoming(commence_time):
-        return results
-
     # best[(market_key, player_name, point_str, outcome_name)] = (decimal_odds, book_title)
     best: dict[tuple, tuple[float, str]] = {}
 
     for bm in event_data.get("bookmakers", []):
         for mkt in bm.get("markets", []):
+            player = mkt.get("description", "Unknown Player")
             mkt_key = mkt["key"]
-            mkt_player = mkt.get("description") or ""
             for out in mkt.get("outcomes", []):
-                # Player name lives on the market OR on each outcome depending on bookmaker
-                player = mkt_player or out.get("description") or "Unknown"
                 point = out.get("point")
                 point_str = str(point) if point is not None else ""
-                price = out.get("price", 0)
-                if price <= 1.0:
-                    continue
                 raw_outcome = str(out.get("name", "")).strip()
                 outcome_lower = raw_outcome.lower()
                 normalized_outcome = (
@@ -357,6 +343,7 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
                     raw_outcome
                 )
                 key = (mkt_key, player, point_str, normalized_outcome)
+                price = out["price"]
                 if key not in best or price > best[key][0]:
                     best[key] = (price, bm["title"])
 
@@ -426,11 +413,9 @@ _MARKET_LABELS = {"h2h": "ML", "spreads": "Spread", "totals": "Total"}
 def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
     results = []
     for ev in events:
-        commence_time = ev.get("commence_time", "")
-        if not _is_today_upcoming(commence_time):
-            continue
         base_name = f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}"
         sport = ev.get("sport_key", "")
+        commence_time = ev.get("commence_time", "")
 
         # === H2H and Totals ===
         # Group by (mkt_type, point_str, outcome_label) — same-line odds only.
@@ -446,12 +431,9 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
                     point = out.get("point")
                     point_str = str(point) if point is not None else ""
                     label = f"{out['name']} {point_str}".strip() if point is not None else out["name"]
-                    price = out["price"]
-                    if price <= 1.0:
-                        continue  # invalid odds — would cause division by zero
                     key = (mkt_type, point_str, label)
-                    if key not in best or price > best[key][0]:
-                        best[key] = (price, bm["title"])
+                    if key not in best or out["price"] > best[key][0]:
+                        best[key] = (out["price"], bm["title"])
 
         groups: dict[tuple, list[Leg]] = {}
         for (mkt_type, point_str, label), (dec, book) in best.items():
@@ -490,12 +472,9 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
                     point = out.get("point")
                     if point is None:
                         continue
-                    price = out["price"]
-                    if price <= 1.0:
-                        continue  # invalid odds
                     key = (out["name"], point)
-                    if key not in spread_best or price > spread_best[key][0]:
-                        spread_best[key] = (price, bm["title"])
+                    if key not in spread_best or out["price"] > spread_best[key][0]:
+                        spread_best[key] = (out["price"], bm["title"])
 
         abs_points = {abs(p) for (_, p) in spread_best if abs(p) > 0}
         for abs_p in abs_points:
@@ -537,18 +516,11 @@ async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str
     url = f"{KALSHI_AUTH_BASE}/login"
     payload = {"email": email, "password": password}
     async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-        body = await resp.text()
         if resp.status != 200:
-            print(f"  [kalshi] Login failed HTTP {resp.status}: {body[:600]}")
             raise ValueError(f"Kalshi login failed (HTTP {resp.status})")
-        try:
-            data = json.loads(body)
-        except Exception:
-            print(f"  [kalshi] Login response not JSON: {body[:600]}")
-            raise ValueError("Kalshi login: non-JSON response")
-        token = data.get("token") or data.get("access_token") or data.get("member_token")
+        data = await resp.json()
+        token = data.get("token")
         if not token:
-            print(f"  [kalshi] Login response keys: {list(data.keys())}  body: {body[:600]}")
             raise ValueError("Kalshi login response missing token")
         print("  [kalshi] Login successful")
         return token
@@ -619,7 +591,7 @@ def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
         no_ask = m.get("no_ask")    # cents — price to BUY no
         if yes_ask is None or no_ask is None:
             continue
-        if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
+        if yes_ask <= 0 or no_ask <= 0:
             continue
 
         # Convert cents to decimal odds: pay X cents to win 100 cents
@@ -659,40 +631,51 @@ def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
 def find_cross_market_arbs(
     sportsbook_opps: list[ArbOpportunity],
     kalshi_opps: list[ArbOpportunity],
-    fuzzy_threshold: float = 0.85,
 ) -> list[ArbOpportunity]:
-    """
-    Attempt to match Kalshi markets to sportsbook events by title similarity
-    and check if mixing the best Kalshi price with the best sportsbook price creates an arb.
-    This is a best-effort heuristic — exact matching requires manual market mapping.
-    """
-    cross = []
-    kalshi_titles = [(k.event_name.lower(), k) for k in kalshi_opps]
+    mappings = list(CROSS_MARKET_MAPPINGS)
+    if CROSS_MARKET_AUTO_MAP_ENABLED:
+        mappings.extend(auto_generate_cross_market_mappings(
+            sportsbook_opps, kalshi_opps, max_hours=CROSS_MARKET_AUTO_MAP_MAX_HOURS
+        ))
+    if not mappings:
+        return []
 
-    for sb in sportsbook_opps:
-        sb_name = sb.event_name.lower()
-        teams = sb_name.replace(" vs ", " ").split()
-        for team in teams:
-            if len(team) < 4:
-                continue
-            for k_title, k_opp in kalshi_titles:
-                if team in k_title:
-                    # Try to combine: use best sportsbook leg + kalshi opposing leg
-                    for sb_leg in sb.legs:
-                        for k_leg in k_opp.legs:
-                            total = sb_leg.implied_prob + k_leg.implied_prob
-                            edge = (1 - total) * 100
-                            if total < 1.0:
-                                cross.append(ArbOpportunity(
-                                    event_name=f"{sb.event_name} [cross-market]",
-                                    sport=sb.sport,
-                                    commence_time=sb.commence_time,
-                                    legs=[sb_leg, k_leg],
-                                    total_implied=total,
-                                    edge_pct=round(edge, 4),
-                                    is_arb=True,
-                                    source="cross",
-                                ))
+    cross = []
+    kalshi_by_ticker = {}
+    for k in kalshi_opps:
+        for leg in k.legs:
+            if "/markets/" in leg.market_url:
+                t = leg.market_url.rsplit("/", 1)[-1].strip().upper()
+                if t:
+                    kalshi_by_ticker[t] = k
+
+    for mapping in mappings:
+        ticker = mapping.kalshi_ticker.strip().upper()
+        k_opp = kalshi_by_ticker.get(ticker)
+        if not k_opp:
+            continue
+        k_leg = next((leg for leg in k_opp.legs if leg.outcome.upper() == mapping.kalshi_leg.upper()), None)
+        if not k_leg:
+            continue
+
+        sb_candidates = [s for s in sportsbook_opps if mapping.sportsbook_event_contains.lower() in s.event_name.lower()]
+        for sb_opp in sb_candidates:
+            for sb_leg in sb_opp.legs:
+                if mapping.sportsbook_outcome_contains.lower() not in sb_leg.outcome.lower():
+                    continue
+                total = sb_leg.implied_prob + k_leg.implied_prob
+                edge = (1 - total) * 100
+                if total < 1.0:
+                    cross.append(ArbOpportunity(
+                        event_name=f"{sb_opp.event_name} [cross-market mapped:{ticker}]",
+                        sport=sb_opp.sport,
+                        commence_time=sb_opp.commence_time,
+                        legs=[sb_leg, k_leg],
+                        total_implied=total,
+                        edge_pct=round(edge, 4),
+                        is_arb=True,
+                        source="cross",
+                    ))
     return cross
 
 
@@ -735,7 +718,7 @@ async def scan(
     sports: Optional[list[str]] = None,
     arbs_only: bool = False,
     min_edge: float = 0.0,
-    include_cross_market: bool = True,
+    include_cross_market: bool = False,
 ) -> ScanResult:
     all_opps: list[ArbOpportunity] = []
     books_seen: set[str] = set()
@@ -800,6 +783,9 @@ async def scan(
                 prop_tasks = []
                 for sp, events in zip(prop_sports, event_lists):
                     if isinstance(events, Exception) or not events:
+                        continue
+                    if events and events[0].get("_quota_limited"):
+                        props_quota_limited = True
                         continue
                     prop_markets = PLAYER_PROP_MARKETS[sp]
                     for ev in events:
@@ -922,3 +908,84 @@ if __name__ == "__main__":
             print_result(result)
 
     asyncio.run(main())
+
+
+PROP_EVENT_CAP_PER_SPORT = 5
+
+CROSS_MARKET_MAPPINGS = []
+CROSS_MARKET_AUTO_MAP_ENABLED = True
+CROSS_MARKET_AUTO_MAP_MAX_HOURS = 24
+
+
+
+def _parse_iso8601_utc(ts: str):
+    if not ts:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _extract_teams_from_event_name(event_name: str):
+    base = event_name.split("[", 1)[0].strip()
+    if " vs " not in base:
+        return None
+    a, b = [x.strip() for x in base.split(" vs ", 1)]
+    return (a, b) if a and b else None
+
+def _infer_yes_team_from_title(title: str, team_a: str, team_b: str):
+    t = title.lower()
+    if f"will {team_a.lower()}" in t:
+        return team_a
+    if f"will {team_b.lower()}" in t:
+        return team_b
+    return None
+
+def auto_generate_cross_market_mappings(sportsbook_opps, kalshi_opps, max_hours: int = 24):
+    from datetime import datetime, timezone
+    mappings = []
+    now = datetime.now(timezone.utc)
+    blocked_tokens = {"championship", "futures", "season", "playoffs", "title", "cup winner"}
+
+    kalshi_items = []
+    for k in kalshi_opps:
+        ticker = ""
+        for leg in k.legs:
+            if "/markets/" in leg.market_url:
+                ticker = leg.market_url.rsplit("/", 1)[-1].strip().upper()
+                if ticker:
+                    break
+        if ticker:
+            kalshi_items.append((k.event_name, ticker, _parse_iso8601_utc(k.commence_time)))
+
+    for sb in sportsbook_opps:
+        if "[ML]" not in sb.event_name:
+            continue
+        teams = _extract_teams_from_event_name(sb.event_name)
+        if not teams:
+            continue
+        team_a, team_b = teams
+        sb_dt = _parse_iso8601_utc(sb.commence_time)
+        if not sb_dt:
+            continue
+        if abs((sb_dt - now).total_seconds()) > max_hours * 3600:
+            continue
+
+        for k_title, ticker, k_dt in kalshi_items:
+            kt = k_title.lower()
+            if any(tok in kt for tok in blocked_tokens):
+                continue
+            if team_a.lower() not in kt or team_b.lower() not in kt:
+                continue
+            if k_dt is not None and abs((k_dt - sb_dt).total_seconds()) > max_hours * 3600:
+                continue
+            yes_team = _infer_yes_team_from_title(k_title, team_a, team_b)
+            if not yes_team:
+                continue
+            no_team = team_b if yes_team == team_a else team_a
+            mappings.append(CrossMarketMapping(f"{team_a} vs {team_b}", no_team, ticker, "YES"))
+            mappings.append(CrossMarketMapping(f"{team_a} vs {team_b}", yes_team, ticker, "NO"))
+
+    dedup = {(m.sportsbook_event_contains, m.sportsbook_outcome_contains, m.kalshi_ticker, m.kalshi_leg): m for m in mappings}
+    return list(dedup.values())

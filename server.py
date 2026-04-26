@@ -76,9 +76,7 @@ async def background_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(background_loop())
-    yield
-    task.cancel()
+    yield  # no background auto-scan; scan only fires on /scan
 
 # ---------------------------------------------------------------------------
 # App
