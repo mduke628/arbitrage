@@ -32,7 +32,7 @@ class Config(BaseModel):
     interval_seconds: int = int(os.getenv("SCAN_INTERVAL", "60"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.0"))
     arbs_only: bool = False
-    sports: list[str] = SPORTS
+    sports: list[str] = []  # empty = scanner fetches all active sports from API at runtime
 
 config = Config()
 last_result: ScanResult | None = None
@@ -105,8 +105,9 @@ async def trigger_scan():
 @app.post("/config")
 async def update_config(new_cfg: Config):
     global config
-    if not new_cfg.sports:
-        new_cfg.sports = SPORTS
+    # Preserve the hardcoded API keys — the UI no longer sends them
+    new_cfg.odds_api_key = config.odds_api_key
+    new_cfg.kalshi_token = config.kalshi_token
     config = new_cfg
     return {"status": "updated", "config": config.model_dump(exclude={"odds_api_key", "kalshi_token"})}
 

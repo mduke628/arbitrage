@@ -87,30 +87,141 @@ BOOKMAKERS = [
 ]
 
 SPORTS = [
+    # American Football
     "americanfootball_nfl",
     "americanfootball_ncaaf",
+    "americanfootball_cfl",
+    "americanfootball_xfl",
+    "americanfootball_ufl",
+    # Basketball
     "basketball_nba",
     "basketball_ncaab",
+    "basketball_wnba",
+    "basketball_euroleague",
+    # Baseball
     "baseball_mlb",
+    "baseball_llws",
+    # Ice Hockey
     "icehockey_nhl",
+    "icehockey_sweden_hockey_league",
+    "icehockey_sweden_allsvenskan",
+    "icehockey_ahl",
+    # Soccer — Top leagues
     "soccer_epl",
-    "soccer_uefa_champs_league",
+    "soccer_germany_bundesliga",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+    "soccer_france_ligue_one",
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
     "soccer_usa_mls",
+    "soccer_uefa_champs_league",
+    "soccer_uefa_europa_league",
+    "soccer_uefa_europa_conference_league",
+    "soccer_world_cup",
+    "soccer_conmebol_copa_america",
+    "soccer_uefa_euro",
+    # Soccer — Secondary leagues
+    "soccer_england_efl_champ",
+    "soccer_england_league1",
+    "soccer_england_league2",
+    "soccer_england_fa_cup",
+    "soccer_england_efl_cup",
+    "soccer_spain_segunda_division",
+    "soccer_germany_bundesliga2",
+    "soccer_italy_serie_b",
+    "soccer_france_ligue_two",
+    "soccer_scotland_premier_league",
+    "soccer_turkey_super_league",
+    "soccer_greece_super_league",
+    "soccer_denmark_superliga",
+    "soccer_norway_eliteserien",
+    "soccer_sweden_allsvenskan",
+    "soccer_finland_veikkausliiga",
+    "soccer_poland_ekstraklasa",
+    "soccer_belgium_first_div",
+    "soccer_switzerland_superleague",
+    "soccer_austria_bundesliga",
+    "soccer_czech_liga",
+    "soccer_romania_liga1",
+    "soccer_croatia_hnl",
+    "soccer_ukraine_premier_league",
+    "soccer_ireland_premier",
+    "soccer_australia_aleague",
+    "soccer_brazil_campeonato",
+    "soccer_brazil_serie_b",
+    "soccer_mexico_ligamx",
+    "soccer_argentina_primera_division",
+    "soccer_conmebol_copa_libertadores",
+    "soccer_korea_kleague1",
+    "soccer_japan_j_league",
+    "soccer_china_superleague",
+    "soccer_usa_nwsl",
+    "soccer_africa_cup_of_nations",
+    # Tennis
     "tennis_atp_french_open",
     "tennis_wta_french_open",
+    "tennis_atp_wimbledon",
+    "tennis_wta_wimbledon",
+    "tennis_atp_us_open",
+    "tennis_wta_us_open",
+    "tennis_atp_australian_open",
+    "tennis_wta_australian_open",
+    # Combat sports
     "mma_mixed_martial_arts",
     "boxing_boxing",
+    # Golf
     "golf_pga_championship",
     "golf_masters_tournament",
-    "soccer_world_cup",
-    "baseball_llws",
+    "golf_the_open_championship",
+    "golf_us_open",
+    "golf_pga_tour",
+    # Cricket
+    "cricket_icc_world_cup",
+    "cricket_big_bash",
+    "cricket_odi",
+    "cricket_test_match",
+    "cricket_ipl",
+    "cricket_t20_wc",
+    # Rugby
+    "rugbyleague_nrl",
+    "rugbyunion_premiership",
+    "rugbyunion_super_rugby",
+    "rugbyunion_six_nations",
+    "rugbyunion_world_cup",
+    "rugbyunion_united_rugby_championship",
+    # Australian Rules
+    "aussierules_afl",
+    # Darts
+    "darts_betway_premier_league",
 ]
+
+async def fetch_all_active_sports(session: aiohttp.ClientSession, api_key: str) -> list[str]:
+    """
+    Query The Odds API for every sport currently active. Returns their keys.
+    Falls back to the static SPORTS list if the endpoint fails.
+    This call does not count against the odds quota.
+    """
+    url = f"{ODDS_API_BASE}/sports/?apiKey={api_key}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                print(f"  [odds-api] /sports returned HTTP {resp.status}, using built-in list")
+                return SPORTS
+            data = await resp.json()
+            active = [s["key"] for s in data if s.get("active", False)]
+            print(f"  [odds-api] {len(active)} active sports found via API")
+            return active
+    except Exception as e:
+        print(f"  [odds-api] Could not fetch sport list ({e}), using built-in list")
+        return SPORTS
+
 
 async def fetch_sport_odds(session: aiohttp.ClientSession, api_key: str, sport: str) -> list[dict]:
     books = ",".join(BOOKMAKERS)
     url = (
         f"{ODDS_API_BASE}/sports/{sport}/odds/"
-        f"?apiKey={api_key}&regions=us,uk,eu&markets=h2h"
+        f"?apiKey={api_key}&regions=us,uk,eu&markets=h2h,spreads,totals"
         f"&oddsFormat=decimal&bookmakers={books}"
     )
     try:
@@ -133,59 +244,63 @@ async def fetch_sport_odds(session: aiohttp.ClientSession, api_key: str, sport: 
         return []
 
 
+_MARKET_LABELS = {"h2h": "ML", "spreads": "Spread", "totals": "Total"}
+
 def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
     results = []
     for ev in events:
-        bookmakers = ev.get("bookmakers", [])
-        # Collect all outcome names
-        outcome_names: set[str] = set()
-        for bm in bookmakers:
+        base_name = f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}"
+
+        # best[(market_type, point_str, outcome_label)] = (decimal_odds, book_title)
+        # Grouping by (market_type, point_str) means we only compare same-line odds —
+        # e.g. Team A -3.5 at Book1 vs Team B +3.5 at Book2, not -3.5 vs -4.0.
+        best: dict[tuple, tuple[float, str]] = {}
+
+        for bm in ev.get("bookmakers", []):
             for mkt in bm.get("markets", []):
-                if mkt["key"] == "h2h":
-                    for out in mkt["outcomes"]:
-                        outcome_names.add(out["name"])
+                mkt_type = mkt["key"]
+                if mkt_type not in ("h2h", "spreads", "totals"):
+                    continue
+                for out in mkt["outcomes"]:
+                    point = out.get("point")
+                    # For spreads/totals include the point in the label so "Team A -3.5"
+                    # and "Team A -4.0" are treated as separate lines.
+                    point_str = str(point) if point is not None else ""
+                    label = f"{out['name']} {point_str}".strip() if point is not None else out["name"]
+                    key = (mkt_type, point_str, label)
+                    price = out["price"]
+                    if key not in best or price > best[key][0]:
+                        best[key] = (price, bm["title"])
 
-        if len(outcome_names) < 2:
-            continue
+        # Re-group into market instances: (market_type, point_str) -> list of best legs
+        groups: dict[tuple, list[Leg]] = {}
+        for (mkt_type, point_str, label), (dec, book) in best.items():
+            group_key = (mkt_type, point_str)
+            groups.setdefault(group_key, []).append(Leg(
+                book=book,
+                outcome=label,
+                decimal_odds=dec,
+                american_odds=decimal_to_american(dec),
+                implied_prob=implied_prob(dec),
+            ))
 
-        # Find best decimal odds per outcome across all books
-        legs: list[Leg] = []
-        for name in outcome_names:
-            best_dec = 0.0
-            best_book = ""
-            for bm in bookmakers:
-                for mkt in bm.get("markets", []):
-                    if mkt["key"] != "h2h":
-                        continue
-                    for out in mkt["outcomes"]:
-                        if out["name"] == name and out["price"] > best_dec:
-                            best_dec = out["price"]
-                            best_book = bm["title"]
-            if best_dec > 0:
-                legs.append(Leg(
-                    book=best_book,
-                    outcome=name,
-                    decimal_odds=best_dec,
-                    american_odds=decimal_to_american(best_dec),
-                    implied_prob=implied_prob(best_dec),
-                ))
-
-        if len(legs) < 2:
-            continue
-
-        total_impl = sum(l.implied_prob for l in legs)
-        edge = (1 - total_impl) * 100
-
-        results.append(ArbOpportunity(
-            event_name=f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}",
-            sport=ev.get("sport_key", ""),
-            commence_time=ev.get("commence_time", ""),
-            legs=legs,
-            total_implied=total_impl,
-            edge_pct=round(edge, 4),
-            is_arb=total_impl < 1.0,
-            source="sportsbook",
-        ))
+        for (mkt_type, point_str), legs in groups.items():
+            if len(legs) < 2:
+                continue
+            total_impl = sum(l.implied_prob for l in legs)
+            edge = (1 - total_impl) * 100
+            tag = _MARKET_LABELS.get(mkt_type, mkt_type)
+            suffix = f" [{tag} {point_str}]" if point_str else f" [{tag}]"
+            results.append(ArbOpportunity(
+                event_name=base_name + suffix,
+                sport=ev.get("sport_key", ""),
+                commence_time=ev.get("commence_time", ""),
+                legs=legs,
+                total_implied=total_impl,
+                edge_pct=round(edge, 4),
+                is_arb=total_impl < 1.0,
+                source="sportsbook",
+            ))
     return results
 
 
@@ -341,14 +456,17 @@ async def scan(
     min_edge: float = 0.0,
     include_cross_market: bool = True,
 ) -> ScanResult:
-    if sports is None or len(sports) == 0:
-        sports = SPORTS
-
     all_opps: list[ArbOpportunity] = []
     books_seen: set[str] = set()
     errors: list[str] = []
 
     async with aiohttp.ClientSession() as session:
+        # Resolve sport list — fetch all active sports from API when none specified
+        if not sports and odds_api_key:
+            sports = await fetch_all_active_sports(session, odds_api_key)
+        elif not sports:
+            sports = SPORTS
+
         tasks = []
 
         if odds_api_key:
