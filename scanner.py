@@ -58,6 +58,8 @@ class ArbOpportunity:
 # ---------------------------------------------------------------------------
 
 def decimal_to_american(dec: float) -> str:
+    if dec <= 1.0:
+        return "N/A"
     if dec >= 2.0:
         return f"+{round((dec - 1) * 100)}"
     return str(round(-100 / (dec - 1)))
@@ -68,6 +70,8 @@ def american_to_decimal(american: float) -> float:
     return (100 / abs(american)) + 1
 
 def implied_prob(decimal_odds: float) -> float:
+    if decimal_odds <= 0:
+        return 1.0
     return 1 / decimal_odds
 
 
@@ -421,9 +425,12 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
                     point = out.get("point")
                     point_str = str(point) if point is not None else ""
                     label = f"{out['name']} {point_str}".strip() if point is not None else out["name"]
+                    price = out["price"]
+                    if price <= 1.0:
+                        continue  # invalid odds — would cause division by zero
                     key = (mkt_type, point_str, label)
-                    if key not in best or out["price"] > best[key][0]:
-                        best[key] = (out["price"], bm["title"])
+                    if key not in best or price > best[key][0]:
+                        best[key] = (price, bm["title"])
 
         groups: dict[tuple, list[Leg]] = {}
         for (mkt_type, point_str, label), (dec, book) in best.items():
@@ -462,9 +469,12 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
                     point = out.get("point")
                     if point is None:
                         continue
+                    price = out["price"]
+                    if price <= 1.0:
+                        continue  # invalid odds
                     key = (out["name"], point)
-                    if key not in spread_best or out["price"] > spread_best[key][0]:
-                        spread_best[key] = (out["price"], bm["title"])
+                    if key not in spread_best or price > spread_best[key][0]:
+                        spread_best[key] = (price, bm["title"])
 
         abs_points = {abs(p) for (_, p) in spread_best if abs(p) > 0}
         for abs_p in abs_points:
@@ -581,7 +591,7 @@ def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
         no_ask = m.get("no_ask")    # cents — price to BUY no
         if yes_ask is None or no_ask is None:
             continue
-        if yes_ask <= 0 or no_ask <= 0:
+        if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
             continue
 
         # Convert cents to decimal odds: pay X cents to win 100 cents
