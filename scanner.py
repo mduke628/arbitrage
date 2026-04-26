@@ -10,7 +10,7 @@ import json
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +66,8 @@ class CrossMarketMapping:
 # ---------------------------------------------------------------------------
 
 def decimal_to_american(dec: float) -> str:
+    if dec <= 1.0:
+        return "N/A"
     if dec >= 2.0:
         return f"+{round((dec - 1) * 100)}"
     return str(round(-100 / (dec - 1)))
@@ -76,6 +78,8 @@ def american_to_decimal(american: float) -> float:
     return (100 / abs(american)) + 1
 
 def implied_prob(decimal_odds: float) -> float:
+    if decimal_odds <= 0:
+        return 1.0
     return 1 / decimal_odds
 
 
@@ -299,18 +303,39 @@ async def fetch_event_player_props(
     """Fetch player prop odds for one event. Returns the raw event object or None."""
     books = ",".join(BOOKMAKERS)
     markets = ",".join(prop_markets)
+    # Note: when 'bookmakers' param is set, 'regions' is ignored by the API.
+    # Using only us region to avoid unexpected 422s from unsupported region combos.
     url = (
         f"{ODDS_API_BASE}/sports/{sport}/events/{event_id}/odds"
-        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets={markets}"
+        f"?apiKey={api_key}&regions=us&markets={markets}"
         f"&oddsFormat=decimal&bookmakers={books}"
     )
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status == 401:
+                print(f"  [props] {sport}/{event_id}: 401 Unauthorized — API key may not support player props (paid tier required)")
+                return None
+            if resp.status == 422:
+                return None  # sport/market combo not available, expected
             if resp.status != 200:
+                print(f"  [props] {sport}/{event_id}: HTTP {resp.status}")
                 return None
             return await resp.json()
-    except Exception:
+    except Exception as e:
+        print(f"  [props] {sport}/{event_id}: {e}")
         return None
+
+
+def _is_today_upcoming(commence_time_str: str) -> bool:
+    """Return True if the event hasn't started yet and begins within the next 24 hours."""
+    if not commence_time_str:
+        return True  # no time info — keep it
+    try:
+        ct = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return now < ct < now + timedelta(hours=24)
+    except Exception:
+        return True  # malformed timestamp — keep it
 
 
 def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
@@ -325,16 +350,24 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
     sport = event_data.get("sport_key", "")
     commence_time = event_data.get("commence_time", "")
 
+    if not _is_today_upcoming(commence_time):
+        return results
+
     # best[(market_key, player_name, point_str, outcome_name)] = (decimal_odds, book_title)
     best: dict[tuple, tuple[float, str]] = {}
 
     for bm in event_data.get("bookmakers", []):
         for mkt in bm.get("markets", []):
-            player = mkt.get("description", "Unknown Player")
             mkt_key = mkt["key"]
+            mkt_player = mkt.get("description") or ""
             for out in mkt.get("outcomes", []):
+                # Player name lives on the market OR on each outcome depending on bookmaker
+                player = mkt_player or out.get("description") or "Unknown"
                 point = out.get("point")
                 point_str = str(point) if point is not None else ""
+                price = out.get("price", 0)
+                if price <= 1.0:
+                    continue
                 raw_outcome = str(out.get("name", "")).strip()
                 outcome_lower = raw_outcome.lower()
                 normalized_outcome = (
@@ -343,7 +376,6 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
                     raw_outcome
                 )
                 key = (mkt_key, player, point_str, normalized_outcome)
-                price = out["price"]
                 if key not in best or price > best[key][0]:
                     best[key] = (price, bm["title"])
 
@@ -413,9 +445,11 @@ _MARKET_LABELS = {"h2h": "ML", "spreads": "Spread", "totals": "Total"}
 def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
     results = []
     for ev in events:
+        commence_time = ev.get("commence_time", "")
+        if not _is_today_upcoming(commence_time):
+            continue
         base_name = f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}"
         sport = ev.get("sport_key", "")
-        commence_time = ev.get("commence_time", "")
 
         # === H2H and Totals ===
         # Group by (mkt_type, point_str, outcome_label) — same-line odds only.
@@ -431,9 +465,12 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
                     point = out.get("point")
                     point_str = str(point) if point is not None else ""
                     label = f"{out['name']} {point_str}".strip() if point is not None else out["name"]
+                    price = out["price"]
+                    if price <= 1.0:
+                        continue  # invalid odds — would cause division by zero
                     key = (mkt_type, point_str, label)
-                    if key not in best or out["price"] > best[key][0]:
-                        best[key] = (out["price"], bm["title"])
+                    if key not in best or price > best[key][0]:
+                        best[key] = (price, bm["title"])
 
         groups: dict[tuple, list[Leg]] = {}
         for (mkt_type, point_str, label), (dec, book) in best.items():
@@ -472,9 +509,12 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
                     point = out.get("point")
                     if point is None:
                         continue
+                    price = out["price"]
+                    if price <= 1.0:
+                        continue  # invalid odds
                     key = (out["name"], point)
-                    if key not in spread_best or out["price"] > spread_best[key][0]:
-                        spread_best[key] = (out["price"], bm["title"])
+                    if key not in spread_best or price > spread_best[key][0]:
+                        spread_best[key] = (price, bm["title"])
 
         abs_points = {abs(p) for (_, p) in spread_best if abs(p) > 0}
         for abs_p in abs_points:
@@ -508,19 +548,26 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 # Kalshi API  (prediction markets)
 # ---------------------------------------------------------------------------
 
-KALSHI_AUTH_BASE = "https://trading-api.kalshi.com/trade-api/v2"
-KALSHI_PUBLIC_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_AUTH_BASE = KALSHI_BASE  # kept for compat with fetch_kalshi_markets
 
 async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str) -> str:
     """Exchange Kalshi email/password for a session token."""
-    url = f"{KALSHI_AUTH_BASE}/login"
+    url = f"{KALSHI_BASE}/login"
     payload = {"email": email, "password": password}
     async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        body = await resp.text()
         if resp.status != 200:
+            print(f"  [kalshi] Login failed HTTP {resp.status}: {body[:600]}")
             raise ValueError(f"Kalshi login failed (HTTP {resp.status})")
-        data = await resp.json()
-        token = data.get("token")
+        try:
+            data = json.loads(body)
+        except Exception:
+            print(f"  [kalshi] Login response not JSON: {body[:600]}")
+            raise ValueError("Kalshi login: non-JSON response")
+        token = data.get("token") or data.get("access_token") or data.get("member_token")
         if not token:
+            print(f"  [kalshi] Login response keys: {list(data.keys())}  body: {body[:600]}")
             raise ValueError("Kalshi login response missing token")
         print("  [kalshi] Login successful")
         return token
@@ -553,35 +600,25 @@ async def fetch_kalshi_markets(session: aiohttp.ClientSession, kalshi_token: str
     Fetch active binary markets from Kalshi and model each YES/NO as a two-leg opportunity.
     Kalshi YES + NO prices should sum to ~$1.00 (100 cents). If they sum to < $1.00, arb exists.
     """
-    bases = [KALSHI_AUTH_BASE, KALSHI_PUBLIC_BASE]
-    errors = []
+    url = f"{KALSHI_BASE}/markets?limit=200&status=open"
+    headers = {"Content-Type": "application/json"}
+    if kalshi_token:
+        headers["Authorization"] = f"Bearer {kalshi_token}"
 
-    for base in bases:
-        url = f"{base}/markets?limit=200&status=open"
-        headers = {"Content-Type": "application/json"}
-        if kalshi_token and base == KALSHI_AUTH_BASE:
-            headers["Authorization"] = f"Bearer {kalshi_token}"
-
-        try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    errors.append(f"{base} HTTP {resp.status}")
-                    continue
-
-                data = await resp.json()
-                markets = data.get("markets", [])
-                sports_markets = [m for m in markets if _looks_like_sports_market(m)]
-                print(
-                    f"  [kalshi] fetched {len(markets)} open markets "
-                    f"({len(sports_markets)} sports-like) from {base}"
-                )
-                return parse_kalshi_markets(sports_markets)
-        except Exception as e:
-            errors.append(f"{base} {e}")
-
-    if errors:
-        print(f"  [kalshi] all endpoints failed: {'; '.join(errors)}")
-    return []
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"  [kalshi] markets HTTP {resp.status}: {body[:300]}")
+                return []
+            data = await resp.json()
+            markets = data.get("markets", [])
+            sports_markets = [m for m in markets if _looks_like_sports_market(m)]
+            print(f"  [kalshi] {len(markets)} open markets ({len(sports_markets)} sports-related)")
+            return parse_kalshi_markets(sports_markets)
+    except Exception as e:
+        print(f"  [kalshi] {e}")
+        return []
 
 
 def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
@@ -591,7 +628,7 @@ def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
         no_ask = m.get("no_ask")    # cents — price to BUY no
         if yes_ask is None or no_ask is None:
             continue
-        if yes_ask <= 0 or no_ask <= 0:
+        if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
             continue
 
         # Convert cents to decimal odds: pay X cents to win 100 cents
@@ -725,12 +762,8 @@ async def scan(
     errors: list[str] = []
 
     async with aiohttp.ClientSession() as session:
-        # Auto-login to Kalshi if email/password provided (UUID key alone is not a bearer token)
-        if kalshi_email and kalshi_password and not kalshi_token:
-            try:
-                kalshi_token = await kalshi_login(session, kalshi_email, kalshi_password)
-            except Exception as e:
-                errors.append(f"Kalshi login: {e}")
+        # Kalshi's elections API is public — no login needed to read market data.
+        # Login is skipped; markets are fetched unauthenticated.
 
         # Resolve sport list — fetch all active sports from API when none specified
         if not sports and odds_api_key:
@@ -745,7 +778,10 @@ async def scan(
                 tasks.append(fetch_sport_odds(session, odds_api_key, sport))
 
         kalshi_task = None
-        if kalshi_token:
+        # Always attempt Kalshi if any credentials were configured.
+        # fetch_kalshi_markets falls back to the public API when token is empty,
+        # so a failed login doesn't silently skip all Kalshi data.
+        if kalshi_token or kalshi_email:
             kalshi_task = fetch_kalshi_markets(session, kalshi_token)
 
         print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_task else '0 Kalshi'} requests...")
@@ -783,10 +819,14 @@ async def scan(
                 prop_tasks = []
                 for sp, events in zip(prop_sports, event_lists):
                     if isinstance(events, Exception) or not events:
+                        print(f"  [props] {sp}: no events found")
                         continue
+work/kalshi-nj-fix
                     if events and events[0].get("_quota_limited"):
                         props_quota_limited = True
                         continue
+                    print(f"  [props] {sp}: {len(events)} event(s)")
+main
                     prop_markets = PLAYER_PROP_MARKETS[sp]
                     for ev in events:
                         prop_tasks.append(
@@ -795,10 +835,13 @@ async def scan(
                 if prop_tasks:
                     print(f"  [props] Fetching props for {len(prop_tasks)} event(s)...")
                     prop_results = await asyncio.gather(*prop_tasks, return_exceptions=True)
+                    none_count = sum(1 for r in prop_results if r is None or isinstance(r, Exception))
                     for res in prop_results:
                         if res and not isinstance(res, Exception):
                             prop_opps.extend(parse_player_props(res))
-                    print(f"  [props] {len(prop_opps)} player prop markets found")
+                    print(f"  [props] {len(prop_opps)} prop markets parsed ({none_count}/{len(prop_tasks)} event fetches failed)")
+                else:
+                    print(f"  [props] No events to fetch props for")
 
         all_opps = sb_opps + kalshi_opps + prop_opps
 
