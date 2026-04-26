@@ -28,7 +28,9 @@ from scanner import scan, run_loop, ScanResult, SPORTS
 
 class Config(BaseModel):
     odds_api_key: str = os.getenv("ODDS_API_KEY", "e4e92b78d437e818a1af0355704c4de9")
-    kalshi_token: str = os.getenv("KALSHI_API_TOKEN", "8b8ae9ee-a48d-4da8-ab18-f9a32d8c990e")
+    kalshi_token: str = ""  # populated at runtime via login; do not hardcode
+    kalshi_email: str = os.getenv("KALSHI_EMAIL", "dukem628@gmail.com")
+    kalshi_password: str = os.getenv("KALSHI_PASSWORD", "F@ntasyB@sk3tball")
     interval_seconds: int = int(os.getenv("SCAN_INTERVAL", "60"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.0"))
     arbs_only: bool = False
@@ -57,11 +59,13 @@ async def broadcast(result: ScanResult):
 
 async def background_loop():
     while True:
-        if config.odds_api_key or config.kalshi_token:
+        if config.odds_api_key or config.kalshi_email:
             try:
                 result = await scan(
                     odds_api_key=config.odds_api_key,
                     kalshi_token=config.kalshi_token,
+                    kalshi_email=config.kalshi_email,
+                    kalshi_password=config.kalshi_password,
                     sports=config.sports,
                     min_edge=config.min_edge,
                 )
@@ -91,11 +95,13 @@ async def status():
 
 @app.get("/scan")
 async def trigger_scan():
-    if not config.odds_api_key and not config.kalshi_token:
-        return JSONResponse(status_code=400, content={"error": "No API keys configured. POST to /config first."})
+    if not config.odds_api_key and not config.kalshi_email:
+        return JSONResponse(status_code=400, content={"error": "No API keys configured."})
     result = await scan(
         odds_api_key=config.odds_api_key,
         kalshi_token=config.kalshi_token,
+        kalshi_email=config.kalshi_email,
+        kalshi_password=config.kalshi_password,
         sports=config.sports,
         min_edge=config.min_edge,
     )
@@ -108,8 +114,10 @@ async def update_config(new_cfg: Config):
     # Preserve the hardcoded API keys — the UI no longer sends them
     new_cfg.odds_api_key = config.odds_api_key
     new_cfg.kalshi_token = config.kalshi_token
+    new_cfg.kalshi_email = config.kalshi_email
+    new_cfg.kalshi_password = config.kalshi_password
     config = new_cfg
-    return {"status": "updated", "config": config.model_dump(exclude={"odds_api_key", "kalshi_token"})}
+    return {"status": "updated", "config": config.model_dump(exclude={"odds_api_key", "kalshi_token", "kalshi_email", "kalshi_password"})}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

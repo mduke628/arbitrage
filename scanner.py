@@ -459,6 +459,21 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 
 KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
 
+async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str) -> str:
+    """Exchange Kalshi email/password for a session token."""
+    url = f"{KALSHI_BASE}/login"
+    payload = {"email": email, "password": password}
+    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        if resp.status != 200:
+            raise ValueError(f"Kalshi login failed (HTTP {resp.status})")
+        data = await resp.json()
+        token = data.get("token")
+        if not token:
+            raise ValueError("Kalshi login response missing token")
+        print("  [kalshi] Login successful")
+        return token
+
+
 async def fetch_kalshi_markets(session: aiohttp.ClientSession, kalshi_token: str) -> list[ArbOpportunity]:
     """
     Fetch active binary markets from Kalshi and model each YES/NO as a two-leg opportunity.
@@ -600,6 +615,8 @@ class ScanResult:
 async def scan(
     odds_api_key: str = "",
     kalshi_token: str = "",
+    kalshi_email: str = "",
+    kalshi_password: str = "",
     sports: Optional[list[str]] = None,
     arbs_only: bool = False,
     min_edge: float = 0.0,
@@ -610,6 +627,13 @@ async def scan(
     errors: list[str] = []
 
     async with aiohttp.ClientSession() as session:
+        # Auto-login to Kalshi if email/password provided (UUID key alone is not a bearer token)
+        if kalshi_email and kalshi_password and not kalshi_token:
+            try:
+                kalshi_token = await kalshi_login(session, kalshi_email, kalshi_password)
+            except Exception as e:
+                errors.append(f"Kalshi login: {e}")
+
         # Resolve sport list — fetch all active sports from API when none specified
         if not sports and odds_api_key:
             sports = await fetch_all_active_sports(session, odds_api_key)
