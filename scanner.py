@@ -10,7 +10,7 @@ import json
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +307,18 @@ async def fetch_event_player_props(
         return None
 
 
+def _is_today_upcoming(commence_time_str: str) -> bool:
+    """Return True if the event hasn't started yet and begins within the next 24 hours."""
+    if not commence_time_str:
+        return True  # no time info — keep it
+    try:
+        ct = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return now < ct < now + timedelta(hours=24)
+    except Exception:
+        return True  # malformed timestamp — keep it
+
+
 def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
     """
     Parse a per-event odds response that contains player prop markets.
@@ -319,16 +331,24 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
     sport = event_data.get("sport_key", "")
     commence_time = event_data.get("commence_time", "")
 
+    if not _is_today_upcoming(commence_time):
+        return results
+
     # best[(market_key, player_name, point_str, outcome_name)] = (decimal_odds, book_title)
     best: dict[tuple, tuple[float, str]] = {}
 
     for bm in event_data.get("bookmakers", []):
         for mkt in bm.get("markets", []):
-            player = mkt.get("description", "Unknown Player")
             mkt_key = mkt["key"]
+            mkt_player = mkt.get("description") or ""
             for out in mkt.get("outcomes", []):
+                # Player name lives on the market OR on each outcome depending on bookmaker
+                player = mkt_player or out.get("description") or "Unknown"
                 point = out.get("point")
                 point_str = str(point) if point is not None else ""
+                price = out.get("price", 0)
+                if price <= 1.0:
+                    continue
                 raw_outcome = str(out.get("name", "")).strip()
                 outcome_lower = raw_outcome.lower()
                 normalized_outcome = (
@@ -337,7 +357,6 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
                     raw_outcome
                 )
                 key = (mkt_key, player, point_str, normalized_outcome)
-                price = out["price"]
                 if key not in best or price > best[key][0]:
                     best[key] = (price, bm["title"])
 
@@ -407,9 +426,11 @@ _MARKET_LABELS = {"h2h": "ML", "spreads": "Spread", "totals": "Total"}
 def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
     results = []
     for ev in events:
+        commence_time = ev.get("commence_time", "")
+        if not _is_today_upcoming(commence_time):
+            continue
         base_name = f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}"
         sport = ev.get("sport_key", "")
-        commence_time = ev.get("commence_time", "")
 
         # === H2H and Totals ===
         # Group by (mkt_type, point_str, outcome_label) — same-line odds only.
@@ -516,11 +537,18 @@ async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str
     url = f"{KALSHI_AUTH_BASE}/login"
     payload = {"email": email, "password": password}
     async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        body = await resp.text()
         if resp.status != 200:
+            print(f"  [kalshi] Login failed HTTP {resp.status}: {body[:600]}")
             raise ValueError(f"Kalshi login failed (HTTP {resp.status})")
-        data = await resp.json()
-        token = data.get("token")
+        try:
+            data = json.loads(body)
+        except Exception:
+            print(f"  [kalshi] Login response not JSON: {body[:600]}")
+            raise ValueError("Kalshi login: non-JSON response")
+        token = data.get("token") or data.get("access_token") or data.get("member_token")
         if not token:
+            print(f"  [kalshi] Login response keys: {list(data.keys())}  body: {body[:600]}")
             raise ValueError("Kalshi login response missing token")
         print("  [kalshi] Login successful")
         return token

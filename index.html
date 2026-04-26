@@ -318,6 +318,8 @@ function decToAmerican(dec) {
   return '' + Math.round(-100 / (dec - 1));
 }
 
+function roundTo5(x) { return Math.round(x / 5) * 5; }
+
 function render() {
   const minEdge = parseFloat(document.getElementById('minEdge').value) || 0;
   const stake = parseFloat(document.getElementById('stake').value) || 1000;
@@ -340,7 +342,8 @@ function render() {
     const sport = (o.sport || '').replace(/_/g,' ').replace('americanfootball','football');
     const date = o.commence_time ? new Date(o.commence_time).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
 
-    const stakes = o.stakes_1000 ? o.stakes_1000.map(s => (s * stake / 1000)) : [];
+    const stakes = o.stakes_1000 ? o.stakes_1000.map(s => roundTo5(s * stake / 1000)) : [];
+    const totalStaked = stakes.reduce((a,b) => a+b, 0);
     const profit = o.guaranteed_profit_1000 != null ? (o.guaranteed_profit_1000 * stake / 1000) : 0;
 
     const legsHtml = (o.legs || []).map((l, li) => `
@@ -348,12 +351,12 @@ function render() {
         <div class="leg-book">${l.book}</div>
         <div class="leg-outcome">${l.outcome}</div>
         <div class="leg-odds">${typeof l.decimal_odds === 'number' ? l.decimal_odds.toFixed(3) : l.decimal_odds} <span style="font-size:11px;color:var(--muted)">(${l.american_odds})</span></div>
-        <div class="leg-stake">Stake: $${stakes[li] ? stakes[li].toFixed(2) : '—'}</div>
+        <div class="leg-stake">Stake: $${stakes[li] ? roundTo5(stakes[li]) : '—'}</div>
         ${l.market_url ? `<div style="margin-top:4px"><a href="${l.market_url}" style="font-size:11px;color:var(--blue)">View market ↗</a></div>` : ''}
       </div>`).join('');
 
     const profitSection = isArb
-      ? `<div class="profit-bar"><span class="pb-label">Guaranteed profit on $${stake.toFixed(0)}</span><span class="pb-val">+$${profit.toFixed(2)}</span></div>`
+      ? `<div class="profit-bar"><span class="pb-label">Guaranteed profit on $${totalStaked} total stake</span><span class="pb-val">+$${profit.toFixed(0)}</span></div>`
       : `<div class="no-arb-bar">Book margin: ${(-o.edge_pct).toFixed(2)}% · No arb at current odds</div>`;
 
     return `
@@ -363,7 +366,7 @@ function render() {
         <span class="opp-name">${o.event_name}</span>
         <span class="sport-tag">${sport}</span>
         <span class="source-tag ${o.source}">${o.source}</span>
-        ${isArb ? `<span class="profit-chip">+$${profit.toFixed(2)}</span>` : ''}
+        ${isArb ? `<span class="profit-chip">+$${profit.toFixed(0)}</span>` : ''}
         <span class="chevron" id="oc${i}">›</span>
       </div>
       <div class="opp-body" id="ob${i}">
