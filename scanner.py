@@ -399,38 +399,32 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
     results = []
     for ev in events:
         base_name = f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}"
+        sport = ev.get("sport_key", "")
+        commence_time = ev.get("commence_time", "")
 
-        # best[(market_type, point_str, outcome_label)] = (decimal_odds, book_title)
-        # Grouping by (market_type, point_str) means we only compare same-line odds —
-        # e.g. Team A -3.5 at Book1 vs Team B +3.5 at Book2, not -3.5 vs -4.0.
+        # === H2H and Totals ===
+        # Group by (mkt_type, point_str, outcome_label) — same-line odds only.
+        # Totals are safe: "Over 6.5" and "Under 6.5" share point_str "6.5" and
+        # are genuinely complementary, so grouping by raw point is correct.
         best: dict[tuple, tuple[float, str]] = {}
-
         for bm in ev.get("bookmakers", []):
             for mkt in bm.get("markets", []):
                 mkt_type = mkt["key"]
-                if mkt_type not in ("h2h", "spreads", "totals"):
+                if mkt_type not in ("h2h", "totals"):
                     continue
                 for out in mkt["outcomes"]:
                     point = out.get("point")
-                    # For spreads/totals include the point in the label so "Team A -3.5"
-                    # and "Team A -4.0" are treated as separate lines.
                     point_str = str(point) if point is not None else ""
                     label = f"{out['name']} {point_str}".strip() if point is not None else out["name"]
                     key = (mkt_type, point_str, label)
-                    price = out["price"]
-                    if key not in best or price > best[key][0]:
-                        best[key] = (price, bm["title"])
+                    if key not in best or out["price"] > best[key][0]:
+                        best[key] = (out["price"], bm["title"])
 
-        # Re-group into market instances: (market_type, point_str) -> list of best legs
         groups: dict[tuple, list[Leg]] = {}
         for (mkt_type, point_str, label), (dec, book) in best.items():
-            group_key = (mkt_type, point_str)
-            groups.setdefault(group_key, []).append(Leg(
-                book=book,
-                outcome=label,
-                decimal_odds=dec,
-                american_odds=decimal_to_american(dec),
-                implied_prob=implied_prob(dec),
+            groups.setdefault((mkt_type, point_str), []).append(Leg(
+                book=book, outcome=label, decimal_odds=dec,
+                american_odds=decimal_to_american(dec), implied_prob=implied_prob(dec),
             ))
 
         for (mkt_type, point_str), legs in groups.items():
@@ -442,14 +436,56 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
             suffix = f" [{tag} {point_str}]" if point_str else f" [{tag}]"
             results.append(ArbOpportunity(
                 event_name=base_name + suffix,
-                sport=ev.get("sport_key", ""),
-                commence_time=ev.get("commence_time", ""),
-                legs=legs,
-                total_implied=total_impl,
-                edge_pct=round(edge, 4),
-                is_arb=total_impl < 1.0,
+                sport=sport, commence_time=commence_time,
+                legs=legs, total_implied=total_impl,
+                edge_pct=round(edge, 4), is_arb=total_impl < 1.0,
                 source="sportsbook",
             ))
+
+        # === Spreads ===
+        # Spreads CANNOT use raw point grouping. "Team A -1.5" and "Team B -1.5"
+        # are NOT complementary — both can lose if the margin is exactly 1.
+        # A valid spread arb must pair (Team A -X) with (Team B +X).
+        # We build a lookup keyed by (team_name, point_value), then explicitly
+        # pair each negative-point leg with the opposing team's positive-point leg.
+        spread_best: dict[tuple, tuple[float, str]] = {}
+        for bm in ev.get("bookmakers", []):
+            for mkt in bm.get("markets", []):
+                if mkt["key"] != "spreads":
+                    continue
+                for out in mkt["outcomes"]:
+                    point = out.get("point")
+                    if point is None:
+                        continue
+                    key = (out["name"], point)
+                    if key not in spread_best or out["price"] > spread_best[key][0]:
+                        spread_best[key] = (out["price"], bm["title"])
+
+        abs_points = {abs(p) for (_, p) in spread_best if abs(p) > 0}
+        for abs_p in abs_points:
+            neg_side = {t: v for (t, p), v in spread_best.items() if p == -abs_p}
+            pos_side = {t: v for (t, p), v in spread_best.items() if p == abs_p}
+            for team_neg, (dec_neg, book_neg) in neg_side.items():
+                for team_pos, (dec_pos, book_pos) in pos_side.items():
+                    if team_neg == team_pos:
+                        continue  # same team on both sides — not a valid cover
+                    legs = [
+                        Leg(book=book_neg, outcome=f"{team_neg} -{abs_p}",
+                            decimal_odds=dec_neg, american_odds=decimal_to_american(dec_neg),
+                            implied_prob=implied_prob(dec_neg)),
+                        Leg(book=book_pos, outcome=f"{team_pos} +{abs_p}",
+                            decimal_odds=dec_pos, american_odds=decimal_to_american(dec_pos),
+                            implied_prob=implied_prob(dec_pos)),
+                    ]
+                    total_impl = sum(l.implied_prob for l in legs)
+                    edge = (1 - total_impl) * 100
+                    results.append(ArbOpportunity(
+                        event_name=f"{base_name} [Spread ±{abs_p}]",
+                        sport=sport, commence_time=commence_time,
+                        legs=legs, total_implied=total_impl,
+                        edge_pct=round(edge, 4), is_arb=total_impl < 1.0,
+                        source="sportsbook",
+                    ))
     return results
 
 
