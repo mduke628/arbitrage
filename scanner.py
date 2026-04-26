@@ -538,12 +538,12 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 # Kalshi API  (prediction markets)
 # ---------------------------------------------------------------------------
 
-KALSHI_AUTH_BASE = "https://trading-api.kalshi.com/trade-api/v2"
-KALSHI_PUBLIC_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_AUTH_BASE = KALSHI_BASE  # kept for compat with fetch_kalshi_markets
 
 async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str) -> str:
     """Exchange Kalshi email/password for a session token."""
-    url = f"{KALSHI_AUTH_BASE}/login"
+    url = f"{KALSHI_BASE}/login"
     payload = {"email": email, "password": password}
     async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
         body = await resp.text()
@@ -590,35 +590,25 @@ async def fetch_kalshi_markets(session: aiohttp.ClientSession, kalshi_token: str
     Fetch active binary markets from Kalshi and model each YES/NO as a two-leg opportunity.
     Kalshi YES + NO prices should sum to ~$1.00 (100 cents). If they sum to < $1.00, arb exists.
     """
-    bases = [KALSHI_AUTH_BASE, KALSHI_PUBLIC_BASE]
-    errors = []
+    url = f"{KALSHI_BASE}/markets?limit=200&status=open"
+    headers = {"Content-Type": "application/json"}
+    if kalshi_token:
+        headers["Authorization"] = f"Bearer {kalshi_token}"
 
-    for base in bases:
-        url = f"{base}/markets?limit=200&status=open"
-        headers = {"Content-Type": "application/json"}
-        if kalshi_token and base == KALSHI_AUTH_BASE:
-            headers["Authorization"] = f"Bearer {kalshi_token}"
-
-        try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    errors.append(f"{base} HTTP {resp.status}")
-                    continue
-
-                data = await resp.json()
-                markets = data.get("markets", [])
-                sports_markets = [m for m in markets if _looks_like_sports_market(m)]
-                print(
-                    f"  [kalshi] fetched {len(markets)} open markets "
-                    f"({len(sports_markets)} sports-like) from {base}"
-                )
-                return parse_kalshi_markets(sports_markets)
-        except Exception as e:
-            errors.append(f"{base} {e}")
-
-    if errors:
-        print(f"  [kalshi] all endpoints failed: {'; '.join(errors)}")
-    return []
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"  [kalshi] markets HTTP {resp.status}: {body[:300]}")
+                return []
+            data = await resp.json()
+            markets = data.get("markets", [])
+            sports_markets = [m for m in markets if _looks_like_sports_market(m)]
+            print(f"  [kalshi] {len(markets)} open markets ({len(sports_markets)} sports-related)")
+            return parse_kalshi_markets(sports_markets)
+    except Exception as e:
+        print(f"  [kalshi] {e}")
+        return []
 
 
 def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
