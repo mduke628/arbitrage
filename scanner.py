@@ -10,7 +10,7 @@ import json
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,8 @@ class ArbOpportunity:
         d = asdict(self)
         d["guaranteed_profit_1000"] = round(self.guaranteed_profit(1000), 2)
         d["stakes_1000"] = [round(s, 2) for s in self.stakes_for(1000)]
+        total = sum(l.implied_prob for l in self.legs) or 1.0
+        d["fair_probs"] = [round(l.implied_prob / total, 4) for l in self.legs]
         return d
 
 
@@ -66,6 +68,8 @@ class CrossMarketMapping:
 # ---------------------------------------------------------------------------
 
 def decimal_to_american(dec: float) -> str:
+    if dec <= 1.0:
+        return "N/A"
     if dec >= 2.0:
         return f"+{round((dec - 1) * 100)}"
     return str(round(-100 / (dec - 1)))
@@ -76,7 +80,21 @@ def american_to_decimal(american: float) -> float:
     return (100 / abs(american)) + 1
 
 def implied_prob(decimal_odds: float) -> float:
+    if decimal_odds <= 0:
+        return 1.0
     return 1 / decimal_odds
+
+
+def _is_today_upcoming(commence_time: str) -> bool:
+    """True only for events starting within the next 24 hours that haven't begun."""
+    if not commence_time:
+        return False
+    try:
+        dt = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    now = datetime.now(timezone.utc)
+    return now < dt < now + timedelta(hours=24)
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +105,9 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 # All bookmakers available on free/paid tiers
 BOOKMAKERS = [
-    # NJ-legal sportsbooks with supported The Odds API bookmaker keys
     "draftkings", "fanduel", "betmgm", "williamhill_us", "betrivers",
     "fanatics", "hardrockbet", "betparx", "espnbet", "ballybet", "bet365",
+    "sporttrade", "borgataonline",
 ]
 
 SPORTS = [
@@ -325,14 +343,21 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
     sport = event_data.get("sport_key", "")
     commence_time = event_data.get("commence_time", "")
 
+    if not _is_today_upcoming(commence_time):
+        return results
+
     # best[(market_key, player_name, point_str, outcome_name)] = (decimal_odds, book_title)
     best: dict[tuple, tuple[float, str]] = {}
 
     for bm in event_data.get("bookmakers", []):
         for mkt in bm.get("markets", []):
-            player = mkt.get("description", "Unknown Player")
+            mkt_player = (mkt.get("description") or "").strip()
             mkt_key = mkt["key"]
             for out in mkt.get("outcomes", []):
+                price = out.get("price", 0)
+                if price <= 1.0:
+                    continue
+                player = mkt_player or (out.get("description") or "Unknown Player").strip()
                 point = out.get("point")
                 point_str = str(point) if point is not None else ""
                 raw_outcome = str(out.get("name", "")).strip()
@@ -343,7 +368,6 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
                     raw_outcome
                 )
                 key = (mkt_key, player, point_str, normalized_outcome)
-                price = out["price"]
                 if key not in best or price > best[key][0]:
                     best[key] = (price, bm["title"])
 
@@ -413,6 +437,8 @@ _MARKET_LABELS = {"h2h": "ML", "spreads": "Spread", "totals": "Total"}
 def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
     results = []
     for ev in events:
+        if not _is_today_upcoming(ev.get("commence_time", "")):
+            continue
         base_name = f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}"
         sport = ev.get("sport_key", "")
         commence_time = ev.get("commence_time", "")
@@ -428,12 +454,15 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
                 if mkt_type not in ("h2h", "totals"):
                     continue
                 for out in mkt["outcomes"]:
+                    price = out.get("price", 0)
+                    if price <= 1.0:
+                        continue
                     point = out.get("point")
                     point_str = str(point) if point is not None else ""
                     label = f"{out['name']} {point_str}".strip() if point is not None else out["name"]
                     key = (mkt_type, point_str, label)
-                    if key not in best or out["price"] > best[key][0]:
-                        best[key] = (out["price"], bm["title"])
+                    if key not in best or price > best[key][0]:
+                        best[key] = (price, bm["title"])
 
         groups: dict[tuple, list[Leg]] = {}
         for (mkt_type, point_str, label), (dec, book) in best.items():
@@ -469,12 +498,15 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
                 if mkt["key"] != "spreads":
                     continue
                 for out in mkt["outcomes"]:
+                    price = out.get("price", 0)
+                    if price <= 1.0:
+                        continue
                     point = out.get("point")
                     if point is None:
                         continue
                     key = (out["name"], point)
-                    if key not in spread_best or out["price"] > spread_best[key][0]:
-                        spread_best[key] = (out["price"], bm["title"])
+                    if key not in spread_best or price > spread_best[key][0]:
+                        spread_best[key] = (price, bm["title"])
 
         abs_points = {abs(p) for (_, p) in spread_best if abs(p) > 0}
         for abs_p in abs_points:
@@ -508,22 +540,7 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 # Kalshi API  (prediction markets)
 # ---------------------------------------------------------------------------
 
-KALSHI_AUTH_BASE = "https://trading-api.kalshi.com/trade-api/v2"
 KALSHI_PUBLIC_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-
-async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str) -> str:
-    """Exchange Kalshi email/password for a session token."""
-    url = f"{KALSHI_AUTH_BASE}/login"
-    payload = {"email": email, "password": password}
-    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-        if resp.status != 200:
-            raise ValueError(f"Kalshi login failed (HTTP {resp.status})")
-        data = await resp.json()
-        token = data.get("token")
-        if not token:
-            raise ValueError("Kalshi login response missing token")
-        print("  [kalshi] Login successful")
-        return token
 
 
 def _looks_like_sports_market(market: dict) -> bool:
@@ -548,40 +565,28 @@ def _looks_like_sports_market(market: dict) -> bool:
     return any(token in text for token in sports_tokens)
 
 
-async def fetch_kalshi_markets(session: aiohttp.ClientSession, kalshi_token: str) -> list[ArbOpportunity]:
+async def fetch_kalshi_markets(session: aiohttp.ClientSession) -> list[ArbOpportunity]:
     """
-    Fetch active binary markets from Kalshi and model each YES/NO as a two-leg opportunity.
-    Kalshi YES + NO prices should sum to ~$1.00 (100 cents). If they sum to < $1.00, arb exists.
+    Fetch active binary markets from Kalshi's public API (no auth required).
+    api.elections.kalshi.com is read-only and open.
     """
-    bases = [KALSHI_AUTH_BASE, KALSHI_PUBLIC_BASE]
-    errors = []
-
-    for base in bases:
-        url = f"{base}/markets?limit=200&status=open"
-        headers = {"Content-Type": "application/json"}
-        if kalshi_token and base == KALSHI_AUTH_BASE:
-            headers["Authorization"] = f"Bearer {kalshi_token}"
-
-        try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    errors.append(f"{base} HTTP {resp.status}")
-                    continue
-
-                data = await resp.json()
-                markets = data.get("markets", [])
-                sports_markets = [m for m in markets if _looks_like_sports_market(m)]
-                print(
-                    f"  [kalshi] fetched {len(markets)} open markets "
-                    f"({len(sports_markets)} sports-like) from {base}"
-                )
-                return parse_kalshi_markets(sports_markets)
-        except Exception as e:
-            errors.append(f"{base} {e}")
-
-    if errors:
-        print(f"  [kalshi] all endpoints failed: {'; '.join(errors)}")
-    return []
+    url = f"{KALSHI_PUBLIC_BASE}/markets?limit=200&status=open"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                print(f"  [kalshi] HTTP {resp.status}")
+                return []
+            data = await resp.json()
+            markets = data.get("markets", [])
+            sports_markets = [m for m in markets if _looks_like_sports_market(m)]
+            print(
+                f"  [kalshi] fetched {len(markets)} open markets "
+                f"({len(sports_markets)} sports-like)"
+            )
+            return parse_kalshi_markets(sports_markets)
+    except Exception as e:
+        print(f"  [kalshi] fetch failed: {e}")
+        return []
 
 
 def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
@@ -725,13 +730,6 @@ async def scan(
     errors: list[str] = []
 
     async with aiohttp.ClientSession() as session:
-        # Auto-login to Kalshi if email/password provided (UUID key alone is not a bearer token)
-        if kalshi_email and kalshi_password and not kalshi_token:
-            try:
-                kalshi_token = await kalshi_login(session, kalshi_email, kalshi_password)
-            except Exception as e:
-                errors.append(f"Kalshi login: {e}")
-
         # Resolve sport list — fetch all active sports from API when none specified
         if not sports and odds_api_key:
             sports = await fetch_all_active_sports(session, odds_api_key)
@@ -744,20 +742,17 @@ async def scan(
             for sport in sports:
                 tasks.append(fetch_sport_odds(session, odds_api_key, sport))
 
-        kalshi_task = None
-        if kalshi_token:
-            kalshi_task = fetch_kalshi_markets(session, kalshi_token)
+        kalshi_task = fetch_kalshi_markets(session)
 
-        print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_task else '0 Kalshi'} requests...")
+        print(f"[scanner] Launching {len(tasks)} sportsbook + 1 Kalshi requests...")
         t0 = time.time()
 
         sb_results_raw = await asyncio.gather(*tasks, return_exceptions=True)
         kalshi_opps: list[ArbOpportunity] = []
-        if kalshi_task:
-            try:
-                kalshi_opps = await kalshi_task
-            except Exception as e:
-                errors.append(f"Kalshi: {e}")
+        try:
+            kalshi_opps = await kalshi_task
+        except Exception as e:
+            errors.append(f"Kalshi: {e}")
 
         sb_opps: list[ArbOpportunity] = []
         for res in sb_results_raw:
@@ -785,7 +780,7 @@ async def scan(
                     if isinstance(events, Exception) or not events:
                         continue
                     if events and events[0].get("_quota_limited"):
-                        props_quota_limited = True
+                        print(f"  [props] {sp}: quota limit hit, skipping")
                         continue
                     prop_markets = PLAYER_PROP_MARKETS[sp]
                     for ev in events:
