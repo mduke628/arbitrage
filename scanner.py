@@ -53,6 +53,14 @@ class ArbOpportunity:
         return d
 
 
+@dataclass(frozen=True)
+class CrossMarketMapping:
+    sportsbook_event_contains: str
+    sportsbook_outcome_contains: str
+    kalshi_ticker: str
+    kalshi_leg: str
+
+
 # ---------------------------------------------------------------------------
 # Odds utilities
 # ---------------------------------------------------------------------------
@@ -274,6 +282,8 @@ async def fetch_sport_events(session: aiohttp.ClientSession, api_key: str, sport
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status in (401, 422):
                 return []
+            if resp.status == 429:
+                return [{"_quota_limited": True}]
             if resp.status != 200:
                 print(f"  [props] {sport} events: HTTP {resp.status}")
                 return []
@@ -658,40 +668,51 @@ def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
 def find_cross_market_arbs(
     sportsbook_opps: list[ArbOpportunity],
     kalshi_opps: list[ArbOpportunity],
-    fuzzy_threshold: float = 0.85,
 ) -> list[ArbOpportunity]:
-    """
-    Attempt to match Kalshi markets to sportsbook events by title similarity
-    and check if mixing the best Kalshi price with the best sportsbook price creates an arb.
-    This is a best-effort heuristic — exact matching requires manual market mapping.
-    """
-    cross = []
-    kalshi_titles = [(k.event_name.lower(), k) for k in kalshi_opps]
+    mappings = list(CROSS_MARKET_MAPPINGS)
+    if CROSS_MARKET_AUTO_MAP_ENABLED:
+        mappings.extend(auto_generate_cross_market_mappings(
+            sportsbook_opps, kalshi_opps, max_hours=CROSS_MARKET_AUTO_MAP_MAX_HOURS
+        ))
+    if not mappings:
+        return []
 
-    for sb in sportsbook_opps:
-        sb_name = sb.event_name.lower()
-        teams = sb_name.replace(" vs ", " ").split()
-        for team in teams:
-            if len(team) < 4:
-                continue
-            for k_title, k_opp in kalshi_titles:
-                if team in k_title:
-                    # Try to combine: use best sportsbook leg + kalshi opposing leg
-                    for sb_leg in sb.legs:
-                        for k_leg in k_opp.legs:
-                            total = sb_leg.implied_prob + k_leg.implied_prob
-                            edge = (1 - total) * 100
-                            if total < 1.0:
-                                cross.append(ArbOpportunity(
-                                    event_name=f"{sb.event_name} [cross-market]",
-                                    sport=sb.sport,
-                                    commence_time=sb.commence_time,
-                                    legs=[sb_leg, k_leg],
-                                    total_implied=total,
-                                    edge_pct=round(edge, 4),
-                                    is_arb=True,
-                                    source="cross",
-                                ))
+    cross = []
+    kalshi_by_ticker = {}
+    for k in kalshi_opps:
+        for leg in k.legs:
+            if "/markets/" in leg.market_url:
+                t = leg.market_url.rsplit("/", 1)[-1].strip().upper()
+                if t:
+                    kalshi_by_ticker[t] = k
+
+    for mapping in mappings:
+        ticker = mapping.kalshi_ticker.strip().upper()
+        k_opp = kalshi_by_ticker.get(ticker)
+        if not k_opp:
+            continue
+        k_leg = next((leg for leg in k_opp.legs if leg.outcome.upper() == mapping.kalshi_leg.upper()), None)
+        if not k_leg:
+            continue
+
+        sb_candidates = [s for s in sportsbook_opps if mapping.sportsbook_event_contains.lower() in s.event_name.lower()]
+        for sb_opp in sb_candidates:
+            for sb_leg in sb_opp.legs:
+                if mapping.sportsbook_outcome_contains.lower() not in sb_leg.outcome.lower():
+                    continue
+                total = sb_leg.implied_prob + k_leg.implied_prob
+                edge = (1 - total) * 100
+                if total < 1.0:
+                    cross.append(ArbOpportunity(
+                        event_name=f"{sb_opp.event_name} [cross-market mapped:{ticker}]",
+                        sport=sb_opp.sport,
+                        commence_time=sb_opp.commence_time,
+                        legs=[sb_leg, k_leg],
+                        total_implied=total,
+                        edge_pct=round(edge, 4),
+                        is_arb=True,
+                        source="cross",
+                    ))
     return cross
 
 
@@ -734,7 +755,7 @@ async def scan(
     sports: Optional[list[str]] = None,
     arbs_only: bool = False,
     min_edge: float = 0.0,
-    include_cross_market: bool = True,
+    include_cross_market: bool = False,
 ) -> ScanResult:
     all_opps: list[ArbOpportunity] = []
     books_seen: set[str] = set()
@@ -800,7 +821,12 @@ async def scan(
                     if isinstance(events, Exception) or not events:
                         print(f"  [props] {sp}: no events found")
                         continue
+work/kalshi-nj-fix
+                    if events and events[0].get("_quota_limited"):
+                        props_quota_limited = True
+                        continue
                     print(f"  [props] {sp}: {len(events)} event(s)")
+main
                     prop_markets = PLAYER_PROP_MARKETS[sp]
                     for ev in events:
                         prop_tasks.append(
@@ -925,3 +951,84 @@ if __name__ == "__main__":
             print_result(result)
 
     asyncio.run(main())
+
+
+PROP_EVENT_CAP_PER_SPORT = 5
+
+CROSS_MARKET_MAPPINGS = []
+CROSS_MARKET_AUTO_MAP_ENABLED = True
+CROSS_MARKET_AUTO_MAP_MAX_HOURS = 24
+
+
+
+def _parse_iso8601_utc(ts: str):
+    if not ts:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _extract_teams_from_event_name(event_name: str):
+    base = event_name.split("[", 1)[0].strip()
+    if " vs " not in base:
+        return None
+    a, b = [x.strip() for x in base.split(" vs ", 1)]
+    return (a, b) if a and b else None
+
+def _infer_yes_team_from_title(title: str, team_a: str, team_b: str):
+    t = title.lower()
+    if f"will {team_a.lower()}" in t:
+        return team_a
+    if f"will {team_b.lower()}" in t:
+        return team_b
+    return None
+
+def auto_generate_cross_market_mappings(sportsbook_opps, kalshi_opps, max_hours: int = 24):
+    from datetime import datetime, timezone
+    mappings = []
+    now = datetime.now(timezone.utc)
+    blocked_tokens = {"championship", "futures", "season", "playoffs", "title", "cup winner"}
+
+    kalshi_items = []
+    for k in kalshi_opps:
+        ticker = ""
+        for leg in k.legs:
+            if "/markets/" in leg.market_url:
+                ticker = leg.market_url.rsplit("/", 1)[-1].strip().upper()
+                if ticker:
+                    break
+        if ticker:
+            kalshi_items.append((k.event_name, ticker, _parse_iso8601_utc(k.commence_time)))
+
+    for sb in sportsbook_opps:
+        if "[ML]" not in sb.event_name:
+            continue
+        teams = _extract_teams_from_event_name(sb.event_name)
+        if not teams:
+            continue
+        team_a, team_b = teams
+        sb_dt = _parse_iso8601_utc(sb.commence_time)
+        if not sb_dt:
+            continue
+        if abs((sb_dt - now).total_seconds()) > max_hours * 3600:
+            continue
+
+        for k_title, ticker, k_dt in kalshi_items:
+            kt = k_title.lower()
+            if any(tok in kt for tok in blocked_tokens):
+                continue
+            if team_a.lower() not in kt or team_b.lower() not in kt:
+                continue
+            if k_dt is not None and abs((k_dt - sb_dt).total_seconds()) > max_hours * 3600:
+                continue
+            yes_team = _infer_yes_team_from_title(k_title, team_a, team_b)
+            if not yes_team:
+                continue
+            no_team = team_b if yes_team == team_a else team_a
+            mappings.append(CrossMarketMapping(f"{team_a} vs {team_b}", no_team, ticker, "YES"))
+            mappings.append(CrossMarketMapping(f"{team_a} vs {team_b}", yes_team, ticker, "NO"))
+
+    dedup = {(m.sportsbook_event_contains, m.sportsbook_outcome_contains, m.kalshi_ticker, m.kalshi_leg): m for m in mappings}
+    return list(dedup.values())
