@@ -81,7 +81,7 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 BOOKMAKERS = [
     "draftkings", "fanduel", "betmgm", "caesars", "bet365",
     "fanatics", "pointsbet", "unibet", "barstool", "bovada",
-    "betonlineag", "pinnacle", "mybookieag", "lowvig",
+    "betonlineag", "mybookieag", "lowvig",
     "betrivers", "superbook", "williamhill_us", "betus",
     "betfred", "betway", "hard_rock", "bet_rivers"
 ]
