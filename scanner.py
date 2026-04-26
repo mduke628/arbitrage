@@ -741,12 +741,8 @@ async def scan(
     errors: list[str] = []
 
     async with aiohttp.ClientSession() as session:
-        # Auto-login to Kalshi if email/password provided (UUID key alone is not a bearer token)
-        if kalshi_email and kalshi_password and not kalshi_token:
-            try:
-                kalshi_token = await kalshi_login(session, kalshi_email, kalshi_password)
-            except Exception as e:
-                errors.append(f"Kalshi login: {e}")
+        # Kalshi's elections API is public — no login needed to read market data.
+        # Login is skipped; markets are fetched unauthenticated.
 
         # Resolve sport list — fetch all active sports from API when none specified
         if not sports and odds_api_key:
