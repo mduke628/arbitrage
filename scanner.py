@@ -198,25 +198,25 @@ SPORTS = [
 
 # Player prop market keys supported by The Odds API, keyed by sport.
 # Only sports listed here will have their per-event prop endpoints queried.
+# Only over/under markets are included — every entry here produces "Over"/"Under"
+# outcomes with a numeric point line. Yes/No props (anytime TD, first basket,
+# double-double, goal scorer, method of victory, cards) are excluded.
 PLAYER_PROP_MARKETS: dict[str, list[str]] = {
     "americanfootball_nfl": [
         "player_pass_tds", "player_pass_yds", "player_pass_completions",
         "player_pass_attempts", "player_pass_interceptions", "player_pass_longest_completion",
         "player_rush_yds", "player_rush_attempts", "player_rush_longest",
         "player_receptions", "player_reception_yds", "player_reception_longest",
-        "player_anytime_td", "player_first_td", "player_last_td",
         "player_kicking_points", "player_field_goals",
     ],
     "americanfootball_ncaaf": [
-        "player_pass_tds", "player_pass_yds", "player_rush_yds",
-        "player_reception_yds", "player_anytime_td",
+        "player_pass_tds", "player_pass_yds", "player_rush_yds", "player_reception_yds",
     ],
     "basketball_nba": [
         "player_points", "player_rebounds", "player_assists", "player_threes",
         "player_blocks", "player_steals", "player_turnovers",
         "player_points_rebounds_assists", "player_points_rebounds",
         "player_points_assists", "player_rebounds_assists",
-        "player_first_basket", "player_double_double", "player_triple_double",
     ],
     "basketball_ncaab": [
         "player_points", "player_rebounds", "player_assists", "player_threes",
@@ -234,29 +234,13 @@ PLAYER_PROP_MARKETS: dict[str, list[str]] = {
         "player_shots_on_goal", "player_saves",
     ],
     "soccer_epl": [
-        "player_goal_scorer_anytime", "player_goal_scorer_first",
-        "player_shots_on_target", "player_assists", "player_cards",
-    ],
-    "soccer_germany_bundesliga": [
-        "player_goal_scorer_anytime", "player_goal_scorer_first",
-    ],
-    "soccer_spain_la_liga": [
-        "player_goal_scorer_anytime", "player_goal_scorer_first",
-    ],
-    "soccer_italy_serie_a": [
-        "player_goal_scorer_anytime", "player_goal_scorer_first",
-    ],
-    "soccer_france_ligue_one": [
-        "player_goal_scorer_anytime", "player_goal_scorer_first",
+        "player_shots_on_target",
     ],
     "soccer_usa_mls": [
-        "player_goal_scorer_anytime", "player_goal_scorer_first",
+        "player_shots_on_target",
     ],
     "soccer_uefa_champs_league": [
-        "player_goal_scorer_anytime", "player_goal_scorer_first",
-    ],
-    "mma_mixed_martial_arts": [
-        "player_method_of_victory",
+        "player_shots_on_target",
     ],
 }
 
@@ -361,6 +345,9 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
 
     for (mkt_key, player, point_str), legs in groups.items():
         if len(legs) < 2:
+            continue
+        # Hard guard: skip anything that isn't a numeric over/under line
+        if {l.outcome for l in legs} != {"Over", "Under"} or not point_str:
             continue
         total_impl = sum(l.implied_prob for l in legs)
         edge = (1 - total_impl) * 100
