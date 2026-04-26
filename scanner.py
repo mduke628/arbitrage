@@ -1,0 +1,785 @@
+"""
+Arbitrage Scanner - Core Engine
+Fetches odds from The Odds API (sportsbooks) and Kalshi (prediction markets),
+detects arbitrage opportunities, and ranks them by edge.
+"""
+
+import asyncio
+import aiohttp
+import json
+import time
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+from datetime import datetime, timezone
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Leg:
+    book: str
+    outcome: str
+    decimal_odds: float
+    american_odds: str
+    implied_prob: float
+    market_url: str = ""
+
+@dataclass
+class ArbOpportunity:
+    event_name: str
+    sport: str
+    commence_time: str
+    legs: list[Leg]
+    total_implied: float
+    edge_pct: float          # positive = arb exists
+    is_arb: bool
+    source: str              # "sportsbook" | "kalshi" | "cross"
+
+    def stakes_for(self, total_stake: float) -> list[float]:
+        """Return optimal stake per leg so payout is equal on all outcomes."""
+        return [(total_stake / self.total_implied) * l.implied_prob for l in self.legs]
+
+    def guaranteed_profit(self, total_stake: float) -> float:
+        stakes = self.stakes_for(total_stake)
+        payout = stakes[0] * self.legs[0].decimal_odds
+        return payout - total_stake
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["guaranteed_profit_1000"] = round(self.guaranteed_profit(1000), 2)
+        d["stakes_1000"] = [round(s, 2) for s in self.stakes_for(1000)]
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Odds utilities
+# ---------------------------------------------------------------------------
+
+def decimal_to_american(dec: float) -> str:
+    if dec >= 2.0:
+        return f"+{round((dec - 1) * 100)}"
+    return str(round(-100 / (dec - 1)))
+
+def american_to_decimal(american: float) -> float:
+    if american > 0:
+        return (american / 100) + 1
+    return (100 / abs(american)) + 1
+
+def implied_prob(decimal_odds: float) -> float:
+    return 1 / decimal_odds
+
+
+# ---------------------------------------------------------------------------
+# The Odds API  (sportsbooks: DraftKings, FanDuel, BetMGM, Caesars, bet365, Fanatics, etc.)
+# ---------------------------------------------------------------------------
+
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+# All bookmakers available on free/paid tiers
+BOOKMAKERS = [
+    "draftkings", "fanduel", "betmgm", "caesars", "bet365",
+    "fanatics", "pointsbet", "unibet", "barstool", "bovada",
+    "betonlineag", "pinnacle", "mybookieag", "lowvig",
+    "betrivers", "superbook", "williamhill_us", "betus",
+    "betfred", "betway", "hard_rock", "bet_rivers"
+]
+
+SPORTS = [
+    # American Football
+    "americanfootball_nfl",
+    "americanfootball_ncaaf",
+    "americanfootball_cfl",
+    "americanfootball_xfl",
+    "americanfootball_ufl",
+    # Basketball
+    "basketball_nba",
+    "basketball_ncaab",
+    "basketball_wnba",
+    "basketball_euroleague",
+    # Baseball
+    "baseball_mlb",
+    "baseball_llws",
+    # Ice Hockey
+    "icehockey_nhl",
+    "icehockey_sweden_hockey_league",
+    "icehockey_sweden_allsvenskan",
+    "icehockey_ahl",
+    # Soccer — Top leagues
+    "soccer_epl",
+    "soccer_germany_bundesliga",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+    "soccer_france_ligue_one",
+    "soccer_netherlands_eredivisie",
+    "soccer_portugal_primeira_liga",
+    "soccer_usa_mls",
+    "soccer_uefa_champs_league",
+    "soccer_uefa_europa_league",
+    "soccer_uefa_europa_conference_league",
+    "soccer_world_cup",
+    "soccer_conmebol_copa_america",
+    "soccer_uefa_euro",
+    # Soccer — Secondary leagues
+    "soccer_england_efl_champ",
+    "soccer_england_league1",
+    "soccer_england_league2",
+    "soccer_england_fa_cup",
+    "soccer_england_efl_cup",
+    "soccer_spain_segunda_division",
+    "soccer_germany_bundesliga2",
+    "soccer_italy_serie_b",
+    "soccer_france_ligue_two",
+    "soccer_scotland_premier_league",
+    "soccer_turkey_super_league",
+    "soccer_greece_super_league",
+    "soccer_denmark_superliga",
+    "soccer_norway_eliteserien",
+    "soccer_sweden_allsvenskan",
+    "soccer_finland_veikkausliiga",
+    "soccer_poland_ekstraklasa",
+    "soccer_belgium_first_div",
+    "soccer_switzerland_superleague",
+    "soccer_austria_bundesliga",
+    "soccer_czech_liga",
+    "soccer_romania_liga1",
+    "soccer_croatia_hnl",
+    "soccer_ukraine_premier_league",
+    "soccer_ireland_premier",
+    "soccer_australia_aleague",
+    "soccer_brazil_campeonato",
+    "soccer_brazil_serie_b",
+    "soccer_mexico_ligamx",
+    "soccer_argentina_primera_division",
+    "soccer_conmebol_copa_libertadores",
+    "soccer_korea_kleague1",
+    "soccer_japan_j_league",
+    "soccer_china_superleague",
+    "soccer_usa_nwsl",
+    "soccer_africa_cup_of_nations",
+    # Tennis
+    "tennis_atp_french_open",
+    "tennis_wta_french_open",
+    "tennis_atp_wimbledon",
+    "tennis_wta_wimbledon",
+    "tennis_atp_us_open",
+    "tennis_wta_us_open",
+    "tennis_atp_australian_open",
+    "tennis_wta_australian_open",
+    # Combat sports
+    "mma_mixed_martial_arts",
+    "boxing_boxing",
+    # Golf
+    "golf_pga_championship",
+    "golf_masters_tournament",
+    "golf_the_open_championship",
+    "golf_us_open",
+    "golf_pga_tour",
+    # Cricket
+    "cricket_icc_world_cup",
+    "cricket_big_bash",
+    "cricket_odi",
+    "cricket_test_match",
+    "cricket_ipl",
+    "cricket_t20_wc",
+    # Rugby
+    "rugbyleague_nrl",
+    "rugbyunion_premiership",
+    "rugbyunion_super_rugby",
+    "rugbyunion_six_nations",
+    "rugbyunion_world_cup",
+    "rugbyunion_united_rugby_championship",
+    # Australian Rules
+    "aussierules_afl",
+    # Darts
+    "darts_betway_premier_league",
+]
+
+# Player prop market keys supported by The Odds API, keyed by sport.
+# Only sports listed here will have their per-event prop endpoints queried.
+# Only over/under markets are included — every entry here produces "Over"/"Under"
+# outcomes with a numeric point line. Yes/No props (anytime TD, first basket,
+# double-double, goal scorer, method of victory, cards) are excluded.
+PLAYER_PROP_MARKETS: dict[str, list[str]] = {
+    "americanfootball_nfl": [
+        "player_pass_tds", "player_pass_yds", "player_pass_completions",
+        "player_pass_attempts", "player_pass_interceptions", "player_pass_longest_completion",
+        "player_rush_yds", "player_rush_attempts", "player_rush_longest",
+        "player_receptions", "player_reception_yds", "player_reception_longest",
+        "player_kicking_points", "player_field_goals",
+    ],
+    "americanfootball_ncaaf": [
+        "player_pass_tds", "player_pass_yds", "player_rush_yds", "player_reception_yds",
+    ],
+    "basketball_nba": [
+        "player_points", "player_rebounds", "player_assists", "player_threes",
+        "player_blocks", "player_steals", "player_turnovers",
+        "player_points_rebounds_assists", "player_points_rebounds",
+        "player_points_assists", "player_rebounds_assists",
+    ],
+    "basketball_ncaab": [
+        "player_points", "player_rebounds", "player_assists", "player_threes",
+    ],
+    "basketball_wnba": [
+        "player_points", "player_rebounds", "player_assists", "player_threes",
+    ],
+    "baseball_mlb": [
+        "player_strikeouts", "player_hits_allowed", "player_earned_runs", "player_walks",
+        "player_total_bases", "player_hits", "player_rbis", "player_runs_scored",
+        "player_hits_runs_rbis", "player_home_runs", "player_stolen_bases",
+    ],
+    "icehockey_nhl": [
+        "player_points", "player_goals", "player_assists",
+        "player_shots_on_goal", "player_saves",
+    ],
+    "soccer_epl": [
+        "player_shots_on_target",
+    ],
+    "soccer_usa_mls": [
+        "player_shots_on_target",
+    ],
+    "soccer_uefa_champs_league": [
+        "player_shots_on_target",
+    ],
+}
+
+async def fetch_all_active_sports(session: aiohttp.ClientSession, api_key: str) -> list[str]:
+    """
+    Query The Odds API for every sport currently active. Returns their keys.
+    Falls back to the static SPORTS list if the endpoint fails.
+    This call does not count against the odds quota.
+    """
+    url = f"{ODDS_API_BASE}/sports/?apiKey={api_key}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                print(f"  [odds-api] /sports returned HTTP {resp.status}, using built-in list")
+                return SPORTS
+            data = await resp.json()
+            active = [s["key"] for s in data if s.get("active", False)]
+            print(f"  [odds-api] {len(active)} active sports found via API")
+            return active
+    except Exception as e:
+        print(f"  [odds-api] Could not fetch sport list ({e}), using built-in list")
+        return SPORTS
+
+
+async def fetch_sport_events(session: aiohttp.ClientSession, api_key: str, sport: str) -> list[dict]:
+    """Return upcoming event objects (with id, home_team, etc.) for a sport."""
+    url = f"{ODDS_API_BASE}/sports/{sport}/events?apiKey={api_key}"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status in (401, 422):
+                return []
+            if resp.status != 200:
+                print(f"  [props] {sport} events: HTTP {resp.status}")
+                return []
+            return await resp.json()
+    except Exception as e:
+        print(f"  [props] {sport} events: {e}")
+        return []
+
+
+async def fetch_event_player_props(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    sport: str,
+    event_id: str,
+    prop_markets: list[str],
+) -> Optional[dict]:
+    """Fetch player prop odds for one event. Returns the raw event object or None."""
+    books = ",".join(BOOKMAKERS)
+    markets = ",".join(prop_markets)
+    url = (
+        f"{ODDS_API_BASE}/sports/{sport}/events/{event_id}/odds"
+        f"?apiKey={api_key}&regions=us,uk,eu&markets={markets}"
+        f"&oddsFormat=decimal&bookmakers={books}"
+    )
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+    except Exception:
+        return None
+
+
+def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
+    """
+    Parse a per-event odds response that contains player prop markets.
+    Each market has a 'description' field with the player name. We group
+    by (market_key, player, point) and find the best price per outcome
+    across all books, then check for arb.
+    """
+    results = []
+    base_name = f"{event_data.get('home_team','?')} vs {event_data.get('away_team','?')}"
+    sport = event_data.get("sport_key", "")
+    commence_time = event_data.get("commence_time", "")
+
+    # best[(market_key, player_name, point_str, outcome_name)] = (decimal_odds, book_title)
+    best: dict[tuple, tuple[float, str]] = {}
+
+    for bm in event_data.get("bookmakers", []):
+        for mkt in bm.get("markets", []):
+            player = mkt.get("description", "Unknown Player")
+            mkt_key = mkt["key"]
+            for out in mkt.get("outcomes", []):
+                point = out.get("point")
+                point_str = str(point) if point is not None else ""
+                key = (mkt_key, player, point_str, out["name"])
+                price = out["price"]
+                if key not in best or price > best[key][0]:
+                    best[key] = (price, bm["title"])
+
+    # Re-group into (market_key, player, point_str) -> legs
+    groups: dict[tuple, list[Leg]] = {}
+    for (mkt_key, player, point_str, outcome), (dec, book) in best.items():
+        groups.setdefault((mkt_key, player, point_str), []).append(Leg(
+            book=book,
+            outcome=outcome,
+            decimal_odds=dec,
+            american_odds=decimal_to_american(dec),
+            implied_prob=implied_prob(dec),
+        ))
+
+    for (mkt_key, player, point_str), legs in groups.items():
+        if len(legs) < 2:
+            continue
+        # Hard guard: skip anything that isn't a numeric over/under line
+        if {l.outcome for l in legs} != {"Over", "Under"} or not point_str:
+            continue
+        total_impl = sum(l.implied_prob for l in legs)
+        edge = (1 - total_impl) * 100
+        prop_label = mkt_key.replace("player_", "").replace("_", " ").title()
+        suffix = f" {point_str}" if point_str else ""
+        results.append(ArbOpportunity(
+            event_name=f"{base_name} · {player} {prop_label}{suffix}",
+            sport=sport,
+            commence_time=commence_time,
+            legs=legs,
+            total_implied=total_impl,
+            edge_pct=round(edge, 4),
+            is_arb=total_impl < 1.0,
+            source="props",
+        ))
+    return results
+
+
+async def fetch_sport_odds(session: aiohttp.ClientSession, api_key: str, sport: str) -> list[dict]:
+    books = ",".join(BOOKMAKERS)
+    url = (
+        f"{ODDS_API_BASE}/sports/{sport}/odds/"
+        f"?apiKey={api_key}&regions=us,uk,eu&markets=h2h,spreads,totals"
+        f"&oddsFormat=decimal&bookmakers={books}"
+    )
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 401:
+                raise ValueError("Invalid Odds API key")
+            if resp.status == 422:
+                return []  # sport not active
+            if resp.status != 200:
+                print(f"  [odds-api] {sport}: HTTP {resp.status}")
+                return []
+            remaining = resp.headers.get("x-requests-remaining", "?")
+            print(f"  [odds-api] {sport}: OK  ({remaining} requests remaining)")
+            return await resp.json()
+    except asyncio.TimeoutError:
+        print(f"  [odds-api] {sport}: timeout")
+        return []
+    except Exception as e:
+        print(f"  [odds-api] {sport}: {e}")
+        return []
+
+
+_MARKET_LABELS = {"h2h": "ML", "spreads": "Spread", "totals": "Total"}
+
+def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
+    results = []
+    for ev in events:
+        base_name = f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}"
+
+        # best[(market_type, point_str, outcome_label)] = (decimal_odds, book_title)
+        # Grouping by (market_type, point_str) means we only compare same-line odds —
+        # e.g. Team A -3.5 at Book1 vs Team B +3.5 at Book2, not -3.5 vs -4.0.
+        best: dict[tuple, tuple[float, str]] = {}
+
+        for bm in ev.get("bookmakers", []):
+            for mkt in bm.get("markets", []):
+                mkt_type = mkt["key"]
+                if mkt_type not in ("h2h", "spreads", "totals"):
+                    continue
+                for out in mkt["outcomes"]:
+                    point = out.get("point")
+                    # For spreads/totals include the point in the label so "Team A -3.5"
+                    # and "Team A -4.0" are treated as separate lines.
+                    point_str = str(point) if point is not None else ""
+                    label = f"{out['name']} {point_str}".strip() if point is not None else out["name"]
+                    key = (mkt_type, point_str, label)
+                    price = out["price"]
+                    if key not in best or price > best[key][0]:
+                        best[key] = (price, bm["title"])
+
+        # Re-group into market instances: (market_type, point_str) -> list of best legs
+        groups: dict[tuple, list[Leg]] = {}
+        for (mkt_type, point_str, label), (dec, book) in best.items():
+            group_key = (mkt_type, point_str)
+            groups.setdefault(group_key, []).append(Leg(
+                book=book,
+                outcome=label,
+                decimal_odds=dec,
+                american_odds=decimal_to_american(dec),
+                implied_prob=implied_prob(dec),
+            ))
+
+        for (mkt_type, point_str), legs in groups.items():
+            if len(legs) < 2:
+                continue
+            total_impl = sum(l.implied_prob for l in legs)
+            edge = (1 - total_impl) * 100
+            tag = _MARKET_LABELS.get(mkt_type, mkt_type)
+            suffix = f" [{tag} {point_str}]" if point_str else f" [{tag}]"
+            results.append(ArbOpportunity(
+                event_name=base_name + suffix,
+                sport=ev.get("sport_key", ""),
+                commence_time=ev.get("commence_time", ""),
+                legs=legs,
+                total_implied=total_impl,
+                edge_pct=round(edge, 4),
+                is_arb=total_impl < 1.0,
+                source="sportsbook",
+            ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Kalshi API  (prediction markets)
+# ---------------------------------------------------------------------------
+
+KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
+
+async def fetch_kalshi_markets(session: aiohttp.ClientSession, kalshi_token: str) -> list[ArbOpportunity]:
+    """
+    Fetch active binary markets from Kalshi and model each YES/NO as a two-leg opportunity.
+    Kalshi YES + NO prices should sum to ~$1.00 (100 cents). If they sum to < $1.00, arb exists.
+    """
+    headers = {"Authorization": f"Bearer {kalshi_token}", "Content-Type": "application/json"}
+    url = f"{KALSHI_BASE}/markets?limit=200&status=open"
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 401:
+                raise ValueError("Invalid Kalshi token")
+            if resp.status != 200:
+                print(f"  [kalshi] HTTP {resp.status}")
+                return []
+            data = await resp.json()
+            markets = data.get("markets", [])
+            print(f"  [kalshi] fetched {len(markets)} open markets")
+            return parse_kalshi_markets(markets)
+    except Exception as e:
+        print(f"  [kalshi] {e}")
+        return []
+
+
+def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
+    results = []
+    for m in markets:
+        yes_ask = m.get("yes_ask")   # cents — price to BUY yes
+        no_ask = m.get("no_ask")    # cents — price to BUY no
+        if yes_ask is None or no_ask is None:
+            continue
+        if yes_ask <= 0 or no_ask <= 0:
+            continue
+
+        # Convert cents to decimal odds: pay X cents to win 100 cents
+        yes_dec = 100 / yes_ask
+        no_dec = 100 / no_ask
+        total_impl = (yes_ask / 100) + (no_ask / 100)
+        edge = (1 - total_impl) * 100
+
+        legs = [
+            Leg(book="Kalshi", outcome="YES", decimal_odds=round(yes_dec, 4),
+                american_odds=decimal_to_american(yes_dec),
+                implied_prob=yes_ask / 100,
+                market_url=f"https://kalshi.com/markets/{m.get('ticker','')}"),
+            Leg(book="Kalshi", outcome="NO", decimal_odds=round(no_dec, 4),
+                american_odds=decimal_to_american(no_dec),
+                implied_prob=no_ask / 100,
+                market_url=f"https://kalshi.com/markets/{m.get('ticker','')}"),
+        ]
+
+        results.append(ArbOpportunity(
+            event_name=m.get("title", m.get("ticker", "Unknown")),
+            sport="prediction_market",
+            commence_time=m.get("close_time", ""),
+            legs=legs,
+            total_implied=total_impl,
+            edge_pct=round(edge, 4),
+            is_arb=total_impl < 1.0,
+            source="kalshi",
+        ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Cross-market arb: Kalshi YES vs sportsbook moneyline
+# ---------------------------------------------------------------------------
+
+def find_cross_market_arbs(
+    sportsbook_opps: list[ArbOpportunity],
+    kalshi_opps: list[ArbOpportunity],
+    fuzzy_threshold: float = 0.85,
+) -> list[ArbOpportunity]:
+    """
+    Attempt to match Kalshi markets to sportsbook events by title similarity
+    and check if mixing the best Kalshi price with the best sportsbook price creates an arb.
+    This is a best-effort heuristic — exact matching requires manual market mapping.
+    """
+    cross = []
+    kalshi_titles = [(k.event_name.lower(), k) for k in kalshi_opps]
+
+    for sb in sportsbook_opps:
+        sb_name = sb.event_name.lower()
+        teams = sb_name.replace(" vs ", " ").split()
+        for team in teams:
+            if len(team) < 4:
+                continue
+            for k_title, k_opp in kalshi_titles:
+                if team in k_title:
+                    # Try to combine: use best sportsbook leg + kalshi opposing leg
+                    for sb_leg in sb.legs:
+                        for k_leg in k_opp.legs:
+                            total = sb_leg.implied_prob + k_leg.implied_prob
+                            edge = (1 - total) * 100
+                            if total < 1.0:
+                                cross.append(ArbOpportunity(
+                                    event_name=f"{sb.event_name} [cross-market]",
+                                    sport=sb.sport,
+                                    commence_time=sb.commence_time,
+                                    legs=[sb_leg, k_leg],
+                                    total_implied=total,
+                                    edge_pct=round(edge, 4),
+                                    is_arb=True,
+                                    source="cross",
+                                ))
+    return cross
+
+
+# ---------------------------------------------------------------------------
+# Main scanner
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScanResult:
+    opportunities: list[ArbOpportunity]
+    arb_count: int
+    total_scanned: int
+    best_edge: float
+    books_seen: set
+    scan_time: str
+    errors: list[str] = field(default_factory=list)
+
+    def arbs_only(self) -> list[ArbOpportunity]:
+        return [o for o in self.opportunities if o.is_arb]
+
+    def sorted_by_edge(self) -> list[ArbOpportunity]:
+        return sorted(self.opportunities, key=lambda o: o.edge_pct, reverse=True)
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "scan_time": self.scan_time,
+            "arb_count": self.arb_count,
+            "total_scanned": self.total_scanned,
+            "best_edge": self.best_edge,
+            "errors": self.errors,
+            "opportunities": [o.to_dict() for o in self.sorted_by_edge()],
+        }, indent=2)
+
+
+async def scan(
+    odds_api_key: str = "",
+    kalshi_token: str = "",
+    sports: Optional[list[str]] = None,
+    arbs_only: bool = False,
+    min_edge: float = 0.0,
+    include_cross_market: bool = True,
+) -> ScanResult:
+    all_opps: list[ArbOpportunity] = []
+    books_seen: set[str] = set()
+    errors: list[str] = []
+
+    async with aiohttp.ClientSession() as session:
+        # Resolve sport list — fetch all active sports from API when none specified
+        if not sports and odds_api_key:
+            sports = await fetch_all_active_sports(session, odds_api_key)
+        elif not sports:
+            sports = SPORTS
+
+        tasks = []
+
+        if odds_api_key:
+            for sport in sports:
+                tasks.append(fetch_sport_odds(session, odds_api_key, sport))
+
+        kalshi_task = None
+        if kalshi_token:
+            kalshi_task = fetch_kalshi_markets(session, kalshi_token)
+
+        print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_task else '0 Kalshi'} requests...")
+        t0 = time.time()
+
+        sb_results_raw = await asyncio.gather(*tasks, return_exceptions=True)
+        kalshi_opps: list[ArbOpportunity] = []
+        if kalshi_task:
+            try:
+                kalshi_opps = await kalshi_task
+            except Exception as e:
+                errors.append(f"Kalshi: {e}")
+
+        sb_opps: list[ArbOpportunity] = []
+        for res in sb_results_raw:
+            if isinstance(res, Exception):
+                errors.append(str(res))
+            elif res:
+                parsed = parse_sportsbook_events(res)
+                sb_opps.extend(parsed)
+                for opp in parsed:
+                    for leg in opp.legs:
+                        books_seen.add(leg.book)
+
+        # Player props — two-step: event IDs first, then per-event prop odds
+        prop_opps: list[ArbOpportunity] = []
+        if odds_api_key:
+            prop_sports = [s for s in sports if s in PLAYER_PROP_MARKETS]
+            if prop_sports:
+                print(f"  [props] Fetching event lists for {len(prop_sports)} sport(s)...")
+                event_lists = await asyncio.gather(
+                    *[fetch_sport_events(session, odds_api_key, sp) for sp in prop_sports],
+                    return_exceptions=True,
+                )
+                prop_tasks = []
+                for sp, events in zip(prop_sports, event_lists):
+                    if isinstance(events, Exception) or not events:
+                        continue
+                    prop_markets = PLAYER_PROP_MARKETS[sp]
+                    for ev in events:
+                        prop_tasks.append(
+                            fetch_event_player_props(session, odds_api_key, sp, ev["id"], prop_markets)
+                        )
+                if prop_tasks:
+                    print(f"  [props] Fetching props for {len(prop_tasks)} event(s)...")
+                    prop_results = await asyncio.gather(*prop_tasks, return_exceptions=True)
+                    for res in prop_results:
+                        if res and not isinstance(res, Exception):
+                            prop_opps.extend(parse_player_props(res))
+                    print(f"  [props] {len(prop_opps)} player prop markets found")
+
+        all_opps = sb_opps + kalshi_opps + prop_opps
+
+        if include_cross_market and sb_opps and kalshi_opps:
+            cross = find_cross_market_arbs(sb_opps, kalshi_opps)
+            all_opps.extend(cross)
+            print(f"  [cross-market] {len(cross)} potential cross-market arbs found")
+
+        elapsed = round(time.time() - t0, 2)
+        print(f"[scanner] Done in {elapsed}s — {len(all_opps)} markets analyzed")
+
+    if arbs_only:
+        all_opps = [o for o in all_opps if o.is_arb]
+    if min_edge > 0:
+        all_opps = [o for o in all_opps if o.edge_pct >= min_edge]
+
+    arb_count = sum(1 for o in all_opps if o.is_arb)
+    best_edge = max((o.edge_pct for o in all_opps if o.is_arb), default=0.0)
+
+    return ScanResult(
+        opportunities=all_opps,
+        arb_count=arb_count,
+        total_scanned=len(all_opps),
+        best_edge=round(best_edge, 4),
+        books_seen=books_seen,
+        scan_time=datetime.now(timezone.utc).isoformat(),
+        errors=errors,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auto-refresh loop
+# ---------------------------------------------------------------------------
+
+async def run_loop(
+    odds_api_key: str = "",
+    kalshi_token: str = "",
+    interval_seconds: int = 60,
+    min_edge: float = 0.0,
+    on_result=None,   # callback(ScanResult)
+    sports: Optional[list[str]] = None,
+):
+    """Continuously scan and call on_result with each ScanResult."""
+    print(f"[scanner] Starting auto-refresh loop (interval={interval_seconds}s)")
+    while True:
+        try:
+            result = await scan(
+                odds_api_key=odds_api_key,
+                kalshi_token=kalshi_token,
+                sports=sports,
+                min_edge=min_edge,
+            )
+            if on_result:
+                on_result(result)
+        except Exception as e:
+            print(f"[scanner] Loop error: {e}")
+        await asyncio.sleep(interval_seconds)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import os
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Arbitrage Scanner")
+    parser.add_argument("--odds-key", default=os.getenv("ODDS_API_KEY", ""), help="The Odds API key")
+    parser.add_argument("--kalshi-token", default=os.getenv("KALSHI_API_TOKEN", ""), help="Kalshi API token")
+    parser.add_argument("--min-edge", type=float, default=0.0, help="Minimum edge %% to display")
+    parser.add_argument("--arbs-only", action="store_true", help="Only show arbs")
+    parser.add_argument("--output", choices=["table", "json"], default="table")
+    parser.add_argument("--loop", action="store_true", help="Run continuously")
+    parser.add_argument("--interval", type=int, default=60, help="Refresh interval (seconds)")
+    args = parser.parse_args()
+
+    def print_result(result: ScanResult):
+        print(f"\n{'='*60}")
+        print(f"  Scan: {result.scan_time}")
+        print(f"  Markets: {result.total_scanned}  |  Arbs: {result.arb_count}  |  Best edge: {result.best_edge}%")
+        print(f"{'='*60}")
+        for opp in result.sorted_by_edge():
+            if not opp.is_arb and args.arbs_only:
+                continue
+            tag = "  [ARB]" if opp.is_arb else "       "
+            print(f"{tag} {opp.edge_pct:+.2f}%  {opp.event_name[:50]:<50}  [{opp.source}]")
+            for i, (leg, stake) in enumerate(zip(opp.legs, opp.stakes_for(1000))):
+                print(f"         Leg {i+1}: {leg.book:<20} {leg.outcome:<20} {leg.american_odds:>6}  stake=${stake:.2f}")
+            if opp.is_arb:
+                print(f"         Profit on $1000: +${opp.guaranteed_profit(1000):.2f}")
+
+    async def main():
+        if args.output == "json":
+            result = await scan(odds_api_key=args.odds_key, kalshi_token=args.kalshi_token, min_edge=args.min_edge)
+            print(result.to_json())
+        elif args.loop:
+            await run_loop(
+                odds_api_key=args.odds_key,
+                kalshi_token=args.kalshi_token,
+                interval_seconds=args.interval,
+                min_edge=args.min_edge,
+                on_result=print_result,
+            )
+        else:
+            result = await scan(odds_api_key=args.odds_key, kalshi_token=args.kalshi_token, min_edge=args.min_edge)
+            print_result(result)
+
+    asyncio.run(main())
