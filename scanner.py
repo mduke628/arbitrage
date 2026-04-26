@@ -83,11 +83,9 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
 # All bookmakers available on free/paid tiers
 BOOKMAKERS = [
-    "draftkings", "fanduel", "betmgm", "caesars", "bet365",
-    "fanatics", "pointsbet", "unibet", "barstool", "bovada",
-    "betonlineag", "mybookieag", "lowvig",
-    "betrivers", "superbook", "williamhill_us", "betus",
-    "betfred", "betway", "hard_rock", "bet_rivers"
+    # NJ-legal sportsbooks with supported The Odds API bookmaker keys
+    "draftkings", "fanduel", "betmgm", "williamhill_us", "betrivers",
+    "fanatics", "hardrockbet", "betparx", "espnbet", "ballybet", "bet365",
 ]
 
 SPORTS = [
@@ -297,7 +295,7 @@ async def fetch_event_player_props(
     markets = ",".join(prop_markets)
     url = (
         f"{ODDS_API_BASE}/sports/{sport}/events/{event_id}/odds"
-        f"?apiKey={api_key}&regions=us,uk,eu&markets={markets}"
+        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets={markets}"
         f"&oddsFormat=decimal&bookmakers={books}"
     )
     try:
@@ -351,7 +349,14 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
                 price = out.get("price", 0)
                 if price <= 1.0:
                     continue
-                key = (mkt_key, player, point_str, out["name"])
+                raw_outcome = str(out.get("name", "")).strip()
+                outcome_lower = raw_outcome.lower()
+                normalized_outcome = (
+                    "Over" if outcome_lower.startswith("over") else
+                    "Under" if outcome_lower.startswith("under") else
+                    raw_outcome
+                )
+                key = (mkt_key, player, point_str, normalized_outcome)
                 if key not in best or price > best[key][0]:
                     best[key] = (price, bm["title"])
 
@@ -393,7 +398,7 @@ async def fetch_sport_odds(session: aiohttp.ClientSession, api_key: str, sport: 
     books = ",".join(BOOKMAKERS)
     url = (
         f"{ODDS_API_BASE}/sports/{sport}/odds/"
-        f"?apiKey={api_key}&regions=us,uk,eu&markets=h2h,spreads,totals"
+        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets=h2h,spreads,totals"
         f"&oddsFormat=decimal&bookmakers={books}"
     )
     try:
@@ -524,11 +529,12 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 # Kalshi API  (prediction markets)
 # ---------------------------------------------------------------------------
 
-KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_AUTH_BASE = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_PUBLIC_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str) -> str:
     """Exchange Kalshi email/password for a session token."""
-    url = f"{KALSHI_BASE}/login"
+    url = f"{KALSHI_AUTH_BASE}/login"
     payload = {"email": email, "password": password}
     async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
         body = await resp.text()
@@ -548,27 +554,62 @@ async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str
         return token
 
 
+def _looks_like_sports_market(market: dict) -> bool:
+    """Best-effort filter for sports-related Kalshi contracts."""
+    category = str(market.get("category") or market.get("event_category") or "").lower()
+    if "sport" in category:
+        return True
+
+    text = " ".join([
+        str(market.get("title", "")),
+        str(market.get("subtitle", "")),
+        str(market.get("ticker", "")),
+        str(market.get("series_ticker", "")),
+        str(market.get("event_ticker", "")),
+    ]).lower()
+    sports_tokens = {
+        "nfl", "nba", "mlb", "nhl", "wnba", "ufc", "mma", "pga", "golf",
+        "soccer", "premier league", "champions league", "tennis", "ncaa", "ncaaf", "ncaab",
+        "super bowl", "world cup", "olympics", "f1", "nascar", "cricket", "boxing",
+        "rangers", "knicks", "mets", "yankees", "giants", "jets", "devils", "islanders",
+    }
+    return any(token in text for token in sports_tokens)
+
+
 async def fetch_kalshi_markets(session: aiohttp.ClientSession, kalshi_token: str) -> list[ArbOpportunity]:
     """
     Fetch active binary markets from Kalshi and model each YES/NO as a two-leg opportunity.
     Kalshi YES + NO prices should sum to ~$1.00 (100 cents). If they sum to < $1.00, arb exists.
     """
-    headers = {"Authorization": f"Bearer {kalshi_token}", "Content-Type": "application/json"}
-    url = f"{KALSHI_BASE}/markets?limit=200&status=open"
-    try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 401:
-                raise ValueError("Invalid Kalshi token")
-            if resp.status != 200:
-                print(f"  [kalshi] HTTP {resp.status}")
-                return []
-            data = await resp.json()
-            markets = data.get("markets", [])
-            print(f"  [kalshi] fetched {len(markets)} open markets")
-            return parse_kalshi_markets(markets)
-    except Exception as e:
-        print(f"  [kalshi] {e}")
-        return []
+    bases = [KALSHI_AUTH_BASE, KALSHI_PUBLIC_BASE]
+    errors = []
+
+    for base in bases:
+        url = f"{base}/markets?limit=200&status=open"
+        headers = {"Content-Type": "application/json"}
+        if kalshi_token and base == KALSHI_AUTH_BASE:
+            headers["Authorization"] = f"Bearer {kalshi_token}"
+
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    errors.append(f"{base} HTTP {resp.status}")
+                    continue
+
+                data = await resp.json()
+                markets = data.get("markets", [])
+                sports_markets = [m for m in markets if _looks_like_sports_market(m)]
+                print(
+                    f"  [kalshi] fetched {len(markets)} open markets "
+                    f"({len(sports_markets)} sports-like) from {base}"
+                )
+                return parse_kalshi_markets(sports_markets)
+        except Exception as e:
+            errors.append(f"{base} {e}")
+
+    if errors:
+        print(f"  [kalshi] all endpoints failed: {'; '.join(errors)}")
+    return []
 
 
 def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
