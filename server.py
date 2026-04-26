@@ -27,7 +27,7 @@ from scanner import scan, run_loop, ScanResult, SPORTS
 # ---------------------------------------------------------------------------
 
 class Config(BaseModel):
-    odds_api_key: str = os.getenv("ODDS_API_KEY", "2d9066e02eb94480c455e7c2f0421dd3")
+    odds_api_key: str = os.getenv("ODDS_API_KEY", "e4e92b78d437e818a1af0355704c4de9")
     kalshi_token: str = os.getenv("KALSHI_API_TOKEN", "8b8ae9ee-a48d-4da8-ab18-f9a32d8c990e")
     interval_seconds: int = int(os.getenv("SCAN_INTERVAL", "60"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.0"))
