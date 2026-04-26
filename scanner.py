@@ -293,17 +293,26 @@ async def fetch_event_player_props(
     """Fetch player prop odds for one event. Returns the raw event object or None."""
     books = ",".join(BOOKMAKERS)
     markets = ",".join(prop_markets)
+    # Note: when 'bookmakers' param is set, 'regions' is ignored by the API.
+    # Using only us region to avoid unexpected 422s from unsupported region combos.
     url = (
         f"{ODDS_API_BASE}/sports/{sport}/events/{event_id}/odds"
-        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets={markets}"
+        f"?apiKey={api_key}&regions=us&markets={markets}"
         f"&oddsFormat=decimal&bookmakers={books}"
     )
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status == 401:
+                print(f"  [props] {sport}/{event_id}: 401 Unauthorized — API key may not support player props (paid tier required)")
+                return None
+            if resp.status == 422:
+                return None  # sport/market combo not available, expected
             if resp.status != 200:
+                print(f"  [props] {sport}/{event_id}: HTTP {resp.status}")
                 return None
             return await resp.json()
-    except Exception:
+    except Exception as e:
+        print(f"  [props] {sport}/{event_id}: {e}")
         return None
 
 
@@ -762,7 +771,10 @@ async def scan(
                 tasks.append(fetch_sport_odds(session, odds_api_key, sport))
 
         kalshi_task = None
-        if kalshi_token:
+        # Always attempt Kalshi if any credentials were configured.
+        # fetch_kalshi_markets falls back to the public API when token is empty,
+        # so a failed login doesn't silently skip all Kalshi data.
+        if kalshi_token or kalshi_email:
             kalshi_task = fetch_kalshi_markets(session, kalshi_token)
 
         print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_task else '0 Kalshi'} requests...")
@@ -800,7 +812,9 @@ async def scan(
                 prop_tasks = []
                 for sp, events in zip(prop_sports, event_lists):
                     if isinstance(events, Exception) or not events:
+                        print(f"  [props] {sp}: no events found")
                         continue
+                    print(f"  [props] {sp}: {len(events)} event(s)")
                     prop_markets = PLAYER_PROP_MARKETS[sp]
                     for ev in events:
                         prop_tasks.append(
@@ -809,10 +823,13 @@ async def scan(
                 if prop_tasks:
                     print(f"  [props] Fetching props for {len(prop_tasks)} event(s)...")
                     prop_results = await asyncio.gather(*prop_tasks, return_exceptions=True)
+                    none_count = sum(1 for r in prop_results if r is None or isinstance(r, Exception))
                     for res in prop_results:
                         if res and not isinstance(res, Exception):
                             prop_opps.extend(parse_player_props(res))
-                    print(f"  [props] {len(prop_opps)} player prop markets found")
+                    print(f"  [props] {len(prop_opps)} prop markets parsed ({none_count}/{len(prop_tasks)} event fetches failed)")
+                else:
+                    print(f"  [props] No events to fetch props for")
 
         all_opps = sb_opps + kalshi_opps + prop_opps
 
