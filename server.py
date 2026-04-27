@@ -74,9 +74,25 @@ async def background_loop():
                 print(f"[server] scan error: {e}")
         await asyncio.sleep(config.interval_seconds)
 
+async def startup_scan():
+    if config.odds_api_key or config.kalshi_email:
+        try:
+            result = await scan(
+                odds_api_key=config.odds_api_key,
+                kalshi_token=config.kalshi_token,
+                kalshi_email=config.kalshi_email,
+                kalshi_password=config.kalshi_password,
+                sports=config.sports,
+                min_edge=config.min_edge,
+            )
+            await broadcast(result)
+        except Exception as e:
+            print(f"[server] startup scan error: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield  # no background auto-scan; scan only fires on /scan
+    asyncio.create_task(startup_scan())
+    yield
 
 # ---------------------------------------------------------------------------
 # App
