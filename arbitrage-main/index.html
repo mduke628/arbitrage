@@ -182,7 +182,7 @@
 
       <div class="filters">
         <button class="tab active" id="tab-arb" onclick="setTab('arb')">Arbs only</button>
-        <button class="tab" id="tab-all" onclick="setTab('all')">All markets</button>
+        <button class="tab" id="tab-ev" onclick="setTab('ev')">+EV</button>
         <label>Min edge %</label>
         <input type="number" id="minEdge" value="0" min="0" max="20" step="0.1" style="width:60px" oninput="render()">
         <label>Stake $</label>
@@ -211,6 +211,7 @@
 <script>
 let ws = null;
 let allOpps = [];
+let allEVBets = [];
 let currentTab = 'arb';
 let nextScan = 0;
 let countdownTimer = null;
@@ -278,6 +279,7 @@ async function pushConfig() {
 
 function ingestResult(data) {
   allOpps = (data.opportunities || []);
+  allEVBets = (data.ev_bets || []);
   document.getElementById('sMarkets').textContent = data.total_scanned ?? '—';
   document.getElementById('sArbs').textContent = data.arb_count ?? '—';
   document.getElementById('sBest').textContent = data.best_edge != null ? '+' + data.best_edge.toFixed(2) + '%' : '—';
@@ -309,7 +311,7 @@ function ingestResult(data) {
 function setTab(tab) {
   currentTab = tab;
   document.getElementById('tab-arb').className = 'tab' + (tab === 'arb' ? ' active' : '');
-  document.getElementById('tab-all').className = 'tab' + (tab === 'all' ? ' active' : '');
+  document.getElementById('tab-ev').className  = 'tab' + (tab === 'ev'  ? ' active' : '');
   render();
 }
 
@@ -319,18 +321,18 @@ function decToAmerican(dec) {
 }
 
 function render() {
+  if (currentTab === 'ev') { renderEV(); return; }
   const minEdge = parseFloat(document.getElementById('minEdge').value) || 0;
   const stake = parseFloat(document.getElementById('stake').value) || 1000;
   const src = document.getElementById('srcFilter').value;
 
-  let filtered = allOpps.filter(o => o.edge_pct >= minEdge);
-  if (currentTab === 'arb') filtered = filtered.filter(o => o.is_arb);
+  let filtered = allOpps.filter(o => o.edge_pct >= minEdge && o.is_arb);
   if (src !== 'all') filtered = filtered.filter(o => o.source === src);
   filtered.sort((a, b) => b.edge_pct - a.edge_pct);
 
   const list = document.getElementById('oppList');
   if (!filtered.length) {
-    list.innerHTML = `<div class="empty"><div class="empty-title">${allOpps.length ? 'No matches' : 'No data'}</div><div class="empty-sub">${allOpps.length ? 'Try lowering the min edge or switching to "All markets".' : 'Connect to the server and trigger a scan.'}</div></div>`;
+    list.innerHTML = `<div class="empty"><div class="empty-title">${allOpps.length ? 'No arbs found' : 'No data'}</div><div class="empty-sub">${allOpps.length ? 'No arbitrage opportunities at current settings. Try the +EV tab.' : 'Connect to the server and trigger a scan.'}</div></div>`;
     return;
   }
 
@@ -370,6 +372,60 @@ function render() {
         ${date ? `<div class="commence">Starts: ${date}</div>` : ''}
         <div class="legs-grid">${legsHtml}</div>
         ${profitSection}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderEV() {
+  const minEdge = parseFloat(document.getElementById('minEdge').value) || 0;
+  const stake = parseFloat(document.getElementById('stake').value) || 1000;
+
+  let filtered = allEVBets.filter(b => b.ev_pct >= minEdge);
+  filtered.sort((a, b) => b.ev_pct - a.ev_pct);
+
+  const list = document.getElementById('oppList');
+  if (!filtered.length) {
+    list.innerHTML = `<div class="empty"><div class="empty-title">${allEVBets.length ? 'No matches' : 'No data'}</div><div class="empty-sub">${allEVBets.length ? 'Try lowering the min edge filter.' : 'Connect to the server and trigger a scan. +EV requires Pinnacle or Lowvig lines to be available.'}</div></div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map((b, i) => {
+    const sport = (b.sport || '').replace(/_/g,' ').replace('americanfootball','football');
+    const date = b.commence_time ? new Date(b.commence_time).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
+    const evStr = '+' + b.ev_pct.toFixed(2) + '%';
+    const evDollars = (b.ev_pct / 100 * stake).toFixed(2);
+
+    return `
+    <div class="opp-card is-arb">
+      <div class="opp-head" onclick="toggle('evb${i}','evc${i}')">
+        <span class="edge-badge pos">${evStr}</span>
+        <span class="opp-name">${b.event_name} · ${b.leg.outcome}</span>
+        <span class="sport-tag">${sport}</span>
+        <span class="source-tag sportsbook">+EV</span>
+        <span class="profit-chip">+$${evDollars}</span>
+        <span class="chevron" id="evc${i}">›</span>
+      </div>
+      <div class="opp-body" id="evb${i}">
+        ${date ? `<div class="commence">Starts: ${date}</div>` : ''}
+        <div class="legs-grid">
+          <div class="leg">
+            <div class="leg-book">${b.leg.book}</div>
+            <div class="leg-outcome">${b.leg.outcome}</div>
+            <div class="leg-odds">${typeof b.leg.decimal_odds === 'number' ? b.leg.decimal_odds.toFixed(3) : b.leg.decimal_odds} <span style="font-size:11px;color:var(--muted)">(${b.leg.american_odds})</span></div>
+            <div class="leg-stake">Implied: ${(b.leg.implied_prob * 100).toFixed(1)}%</div>
+          </div>
+          <div class="leg">
+            <div class="leg-book">${b.sharp_book} (fair line)</div>
+            <div class="leg-outcome">True probability</div>
+            <div class="leg-odds">${(b.sharp_prob * 100).toFixed(1)}%</div>
+            <div class="leg-stake">Your edge: +${b.ev_pct.toFixed(2)}%</div>
+          </div>
+        </div>
+        <div class="profit-bar">
+          <span class="pb-label">Expected value on $${stake.toFixed(0)}</span>
+          <span class="pb-val">+$${evDollars}</span>
+        </div>
       </div>
     </div>`;
   }).join('');

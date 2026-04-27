@@ -86,7 +86,10 @@ BOOKMAKERS = [
     # NJ-legal sportsbooks with supported The Odds API bookmaker keys
     "draftkings", "fanduel", "betmgm", "williamhill_us", "betrivers",
     "fanatics", "hardrockbet", "betparx", "espnbet", "ballybet", "bet365",
+    "pinnacle", "lowvig",
 ]
+
+SHARP_BOOKS = ["pinnacle", "lowvig"]
 
 SPORTS = [
     # American Football
@@ -245,6 +248,114 @@ PLAYER_PROP_MARKETS: dict[str, list[str]] = {
         "player_shots_on_target",
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# +EV detection
+# ---------------------------------------------------------------------------
+
+def _devig_probs(raw_probs: list[float]) -> list[float]:
+    total = sum(raw_probs)
+    return [p / total for p in raw_probs] if total > 0 else raw_probs
+
+
+@dataclass
+class PlusEVBet:
+    event_name: str
+    sport: str
+    commence_time: str
+    leg: Leg
+    sharp_prob: float   # de-vigged true probability from sharp book
+    ev_pct: float       # (fair_prob * decimal_odds - 1) * 100
+    sharp_book: str
+
+    def to_dict(self) -> dict:
+        return {
+            "event_name": self.event_name,
+            "sport": self.sport,
+            "commence_time": self.commence_time,
+            "leg": asdict(self.leg),
+            "sharp_prob": self.sharp_prob,
+            "ev_pct": self.ev_pct,
+            "sharp_book": self.sharp_book,
+            "source": "ev",
+        }
+
+
+def find_plus_ev_bets(events: list[dict]) -> list[PlusEVBet]:
+    """
+    Use the sharpest available book's h2h line as a no-vig reference.
+    Any soft-book outcome priced better than the fair probability is +EV.
+    """
+    results = []
+    for ev in events:
+        base_name = f"{ev.get('home_team','?')} vs {ev.get('away_team','?')}"
+        sport = ev.get("sport_key", "")
+        commence_time = ev.get("commence_time", "")
+        bookmakers = ev.get("bookmakers", [])
+
+        # Find the sharpest book that has an h2h market for this event
+        sharp_h2h: Optional[dict] = None
+        sharp_title = ""
+        for sharp_key in SHARP_BOOKS:
+            for bm in bookmakers:
+                if bm.get("key") != sharp_key:
+                    continue
+                for mkt in bm.get("markets", []):
+                    if mkt["key"] == "h2h" and len(mkt.get("outcomes", [])) >= 2:
+                        sharp_h2h = mkt
+                        sharp_title = bm["title"]
+                        break
+                if sharp_h2h:
+                    break
+            if sharp_h2h:
+                break
+
+        if not sharp_h2h:
+            continue
+
+        # De-vig the sharp line to get fair probabilities
+        sharp_raw = [
+            (out["name"], implied_prob(out["price"]))
+            for out in sharp_h2h["outcomes"]
+            if out.get("price", 0) > 1.0
+        ]
+        if len(sharp_raw) < 2:
+            continue
+        names, probs = zip(*sharp_raw)
+        fair = dict(zip(names, _devig_probs(list(probs))))
+
+        # Check every soft book for +EV pricing vs the fair line
+        for bm in bookmakers:
+            if bm.get("key") in SHARP_BOOKS:
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt["key"] != "h2h":
+                    continue
+                for out in mkt.get("outcomes", []):
+                    name = out["name"]
+                    price = out.get("price", 0)
+                    if price <= 1.0 or name not in fair:
+                        continue
+                    ev_val = fair[name] * price - 1
+                    if ev_val > 0:
+                        results.append(PlusEVBet(
+                            event_name=base_name,
+                            sport=sport,
+                            commence_time=commence_time,
+                            leg=Leg(
+                                book=bm["title"],
+                                outcome=name,
+                                decimal_odds=price,
+                                american_odds=decimal_to_american(price),
+                                implied_prob=implied_prob(price),
+                            ),
+                            sharp_prob=round(fair[name], 4),
+                            ev_pct=round(ev_val * 100, 4),
+                            sharp_book=sharp_title,
+                        ))
+    return results
+
 
 async def fetch_all_active_sports(session: aiohttp.ClientSession, api_key: str) -> list[str]:
     """
@@ -681,6 +792,7 @@ class ScanResult:
     books_seen: set
     scan_time: str
     errors: list[str] = field(default_factory=list)
+    ev_bets: list[PlusEVBet] = field(default_factory=list)
 
     def arbs_only(self) -> list[ArbOpportunity]:
         return [o for o in self.opportunities if o.is_arb]
@@ -696,6 +808,7 @@ class ScanResult:
             "best_edge": self.best_edge,
             "errors": self.errors,
             "opportunities": [o.to_dict() for o in self.sorted_by_edge()],
+            "ev_bets": [b.to_dict() for b in sorted(self.ev_bets, key=lambda b: b.ev_pct, reverse=True)],
         }, indent=2)
 
 
@@ -749,6 +862,7 @@ async def scan(
                 errors.append(f"Kalshi: {e}")
 
         sb_opps: list[ArbOpportunity] = []
+        ev_bets: list[PlusEVBet] = []
         for res in sb_results_raw:
             if isinstance(res, Exception):
                 errors.append(str(res))
@@ -758,6 +872,7 @@ async def scan(
                 for opp in parsed:
                     for leg in opp.legs:
                         books_seen.add(leg.book)
+                ev_bets.extend(find_plus_ev_bets(res))
 
         # Player props — two-step: event IDs first, then per-event prop odds
         prop_opps: list[ArbOpportunity] = []
@@ -812,6 +927,7 @@ async def scan(
         books_seen=books_seen,
         scan_time=datetime.now(timezone.utc).isoformat(),
         errors=errors,
+        ev_bets=ev_bets,
     )
 
 
