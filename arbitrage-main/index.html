@@ -209,6 +209,14 @@
           <label>Min odds – American (optional)</label>
           <input type="text" id="bMinOdds" placeholder="-200">
         </div>
+        <div class="field">
+          <label>Max bet $ (optional)</label>
+          <input type="number" id="bMaxBet" placeholder="50" min="1" step="any">
+        </div>
+        <div class="field">
+          <label>Expires (optional)</label>
+          <input type="datetime-local" id="bExpiry">
+        </div>
         <button class="btn btn-outline" onclick="addBoost()">Add boost</button>
       </div>
 
@@ -404,13 +412,26 @@ function renderBoostList() {
     box.innerHTML = '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">No boosts added.</div>';
     return;
   }
+  const now = new Date();
   box.innerHTML = boosts.map((b, i) => {
+    const expired = b.expiry && new Date(b.expiry) <= now;
     const primary = b.type === 'price'
       ? `${b.book || 'Any book'} → <strong>${b.boostedOdds}</strong>`
       : `${b.book || 'Any book'} <strong>+${b.pct}% profit</strong>`;
-    const meta = [b.keyword ? `"${b.keyword}"` : '', b.minOdds ? `min ${b.minOdds}` : ''].filter(Boolean).join(' · ');
-    return `<div class="boost-chip">
-      <span class="bc-info">${primary}${meta ? `<br><span style="color:var(--muted);font-size:10px">${meta}</span>` : ''}</span>
+    const expiryStr = b.expiry
+      ? new Date(b.expiry).toLocaleString(undefined, {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'})
+      : '';
+    const meta = [
+      b.keyword  ? `"${b.keyword}"`   : '',
+      b.minOdds  ? `min ${b.minOdds}` : '',
+      b.maxBet   ? `max $${b.maxBet}` : '',
+      expiryStr  ? `exp. ${expiryStr}` : '',
+    ].filter(Boolean).join(' · ');
+    return `<div class="boost-chip" style="${expired ? 'border-color:rgba(239,68,68,.4);opacity:.65;' : ''}">
+      <span class="bc-info">
+        ${expired ? '<span style="color:var(--red);font-size:10px">EXPIRED · </span>' : ''}${primary}
+        ${meta ? `<br><span style="color:var(--muted);font-size:10px">${meta}</span>` : ''}
+      </span>
       <span class="bc-del" onclick="deleteBoost(${i})">×</span>
     </div>`;
   }).join('');
@@ -433,16 +454,18 @@ function addBoost() {
   const book    = document.getElementById('bBook').value.trim();
   const keyword = document.getElementById('bKeyword').value.trim();
   const minOdds = document.getElementById('bMinOdds').value.trim();
+  const maxBet  = parseFloat(document.getElementById('bMaxBet').value) || null;
+  const expiry  = document.getElementById('bExpiry').value || '';
 
   if (type === 'price') {
     const raw = document.getElementById('bPrice').value.trim();
     if (!raw) { log('Enter the boosted odds first', 'err'); return; }
     if (!americanToDecimal(raw)) { log('Invalid odds — use American format e.g. +500 or -110', 'err'); return; }
-    boosts.push({ type: 'price', book, boostedOdds: raw, keyword, minOdds });
+    boosts.push({ type: 'price', book, boostedOdds: raw, keyword, minOdds, maxBet, expiry });
   } else {
     const pct = parseFloat(document.getElementById('bPct').value);
     if (!pct || pct <= 0) { log('Enter a valid boost %', 'err'); return; }
-    boosts.push({ type: 'pct', book, pct, keyword, minOdds });
+    boosts.push({ type: 'pct', book, pct, keyword, minOdds, maxBet, expiry });
   }
 
   saveBoosts();
@@ -451,6 +474,8 @@ function addBoost() {
   document.getElementById('bPct').value     = '';
   document.getElementById('bKeyword').value = '';
   document.getElementById('bMinOdds').value = '';
+  document.getElementById('bMaxBet').value  = '';
+  document.getElementById('bExpiry').value  = '';
   render();
 }
 
@@ -469,6 +494,7 @@ function legPassesMinOdds(legDecimal, minOddsAmerican) {
 
 function findBoostForLeg(leg, event_name) {
   return boosts.find(b => {
+    if (b.expiry && new Date(b.expiry) <= new Date()) return false;
     if (b.book && !leg.book.toLowerCase().includes(b.book.toLowerCase())) return false;
     if (b.keyword) {
       const kw = b.keyword.toLowerCase();
@@ -495,12 +521,29 @@ function applyBoostToLeg(leg, boost) {
 
 function applyBoostsToOpp(opp) {
   if (!boosts.length) return opp;
-  const newLegs = opp.legs.map(l => {
-    const b = findBoostForLeg(l, opp.event_name);
-    return b ? applyBoostToLeg(l, b) : l;
-  });
-  if (!newLegs.some(l => l._boost_note)) return opp;
+  const matchedBoosts = opp.legs.map(l => findBoostForLeg(l, opp.event_name));
+  if (!matchedBoosts.some(b => b)) return opp;
 
+  const newLegs = opp.legs.map((l, i) => matchedBoosts[i] ? applyBoostToLeg(l, matchedBoosts[i]) : l);
+
+  // Capped path: a boost with a max bet fixes that leg's stake; counter-legs are sized to match payout.
+  const cappedIdx = matchedBoosts.findIndex(b => b && b.maxBet);
+  if (cappedIdx >= 0) {
+    const maxBet    = matchedBoosts[cappedIdx].maxBet;
+    const payout    = maxBet * newLegs[cappedIdx].decimal_odds;
+    const cappedStakes = newLegs.map((l, i) => i === cappedIdx ? maxBet : payout / l.decimal_odds);
+    const totalStaked  = cappedStakes.reduce((a, b) => a + b, 0);
+    const profit    = payout - totalStaked;
+    const edgePct   = totalStaked > 0 ? Math.round((profit / totalStaked) * 100 * 10000) / 10000 : 0;
+    return {
+      ...opp, legs: newLegs,
+      edge_pct: edgePct, is_arb: profit > 0, _boosted: true,
+      _capped: true, _maxBet: maxBet, _cappedStakes: cappedStakes,
+      _cappedProfit: profit, _cappedTotal: totalStaked,
+    };
+  }
+
+  // Uncapped path: standard implied-prob math.
   const totalImpl = newLegs.reduce((s, l) => s + l.implied_prob, 0);
   const edge = (1 - totalImpl) * 100;
   const stakes1000 = newLegs.map(l => (1000 / totalImpl) * l.implied_prob);
@@ -522,7 +565,7 @@ function applyBoostToEVBet(bet) {
   if (!b) return bet;
   const newLeg = applyBoostToLeg(bet.leg, b);
   const evVal = bet.sharp_prob * newLeg.decimal_odds - 1;
-  return { ...bet, leg: newLeg, ev_pct: Math.round(evVal * 100 * 10000) / 10000, _boosted: true };
+  return { ...bet, leg: newLeg, ev_pct: Math.round(evVal * 100 * 10000) / 10000, _boosted: true, _maxBet: b.maxBet || null };
 }
 
 function isInTimeframe(commence_time, filter) {
@@ -542,6 +585,16 @@ function isLiveBet(commence_time) {
 }
 
 function roundedArbStakes(o, stake, mode) {
+  // Capped boost: stakes are fixed actual dollar amounts, not scaled from $1000.
+  if (o._capped) {
+    const mult = mode === '5' ? 5 : 1;
+    const apply = s => mode === 'exact' ? s : Math.round(s / mult) * mult;
+    const rounded = o._cappedStakes.map(apply);
+    const total = rounded.reduce((a, b) => a + b, 0);
+    const payouts = rounded.map((s, i) => s * ((o.legs && o.legs[i]) ? o.legs[i].decimal_odds : 1));
+    const profit = (payouts.length ? Math.min(...payouts) : 0) - total;
+    return { stakes: rounded, profit, capped: true, total };
+  }
   const rawStakes = o.stakes_1000 ? o.stakes_1000.map(s => s * stake / 1000) : [];
   if (mode === 'exact') {
     return { stakes: rawStakes, profit: o.guaranteed_profit_1000 != null ? o.guaranteed_profit_1000 * stake / 1000 : 0 };
@@ -585,9 +638,12 @@ function render() {
     const sport = (o.sport || '').replace(/_/g,' ').replace('americanfootball','football');
     const date = o.commence_time ? new Date(o.commence_time).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
 
-    const { stakes, profit } = roundedArbStakes(o, stake, roundMode);
+    const { stakes, profit, capped, total: cappedTotal } = roundedArbStakes(o, stake, roundMode);
     const fmtStake  = s => roundMode === 'exact' ? s.toFixed(2) : s.toFixed(0);
     const fmtProfit = p => p.toFixed(2);
+    const profitBarLabel = capped
+      ? `Guaranteed profit · boosted leg max $${o._maxBet} · total $${cappedTotal.toFixed(0)}`
+      : `Guaranteed profit on $${stake.toFixed(0)}`;
 
     const legsHtml = (o.legs || []).map((l, li) => `
       <div class="leg">
@@ -600,7 +656,7 @@ function render() {
       </div>`).join('');
 
     const profitSection = isArb
-      ? `<div class="profit-bar"><span class="pb-label">Guaranteed profit on $${stake.toFixed(0)}</span><span class="pb-val">+$${fmtProfit(profit)}</span></div>`
+      ? `<div class="profit-bar"><span class="pb-label">${profitBarLabel}</span><span class="pb-val">+$${fmtProfit(profit)}</span></div>`
       : `<div class="no-arb-bar">Book margin: ${(-o.edge_pct).toFixed(2)}% · No arb at current odds</div>`;
 
     return `
@@ -647,7 +703,8 @@ function renderEV() {
     const sport = (b.sport || '').replace(/_/g,' ').replace('americanfootball','football');
     const date = b.commence_time ? new Date(b.commence_time).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
     const evStr = '+' + b.ev_pct.toFixed(2) + '%';
-    const evDollars = (b.ev_pct / 100 * stake).toFixed(2);
+    const evStake = b._maxBet || stake;
+    const evDollars = (b.ev_pct / 100 * evStake).toFixed(2);
 
     return `
     <div class="opp-card is-arb">
@@ -677,7 +734,7 @@ function renderEV() {
           </div>
         </div>
         <div class="profit-bar">
-          <span class="pb-label">Expected value on $${stake.toFixed(0)}</span>
+          <span class="pb-label">Expected value on $${evStake.toFixed(0)}${b._maxBet ? ' <span style="font-size:10px;color:var(--amber)">(max bet)</span>' : ''}</span>
           <span class="pb-val">+$${evDollars}</span>
         </div>
       </div>
