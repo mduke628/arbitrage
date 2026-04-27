@@ -124,6 +124,21 @@
   .boost-chip .bc-del { color:var(--muted); cursor:pointer; font-size:14px; margin-left:6px; flex-shrink:0; line-height:1; }
   .boost-chip .bc-del:hover { color:var(--red); }
   .leg-boost { font-size:10px; color:var(--amber); margin-top:2px; }
+
+  /* +EV tab — visually distinct from arb (blue, not green) */
+  .opp-card.is-ev { border-color: rgba(59,130,246,.35); }
+  .ev-chip { font-size:12px; color:#93c5fd; background:rgba(59,130,246,.12); border:1px solid rgba(59,130,246,.25); border-radius:4px; padding:2px 8px; white-space:nowrap; }
+  .ev-bar { display:flex; align-items:center; gap:14px; background:rgba(59,130,246,.08); border:1px solid rgba(59,130,246,.2); border-radius:6px; padding:10px 14px; margin-top:4px; }
+  .ev-bar .pb-label { font-size:12px; color:#93c5fd; flex:1; }
+  .ev-bar .pb-val { font-family:var(--font); font-size:15px; color:#93c5fd; font-weight:bold; }
+  .kelly-bar { display:flex; align-items:center; gap:14px; background:rgba(245,158,11,.08); border:1px solid rgba(245,158,11,.2); border-radius:6px; padding:9px 14px; margin-top:6px; }
+  .kelly-bar .pb-label { font-size:12px; color:var(--amber); flex:1; }
+  .kelly-bar .pb-val { font-family:var(--font); font-size:14px; color:var(--amber); font-weight:bold; }
+  .ev-explainer { background:rgba(59,130,246,.05); border:1px solid rgba(59,130,246,.18); border-radius:8px; padding:10px 14px; margin-bottom:12px; font-size:12px; color:var(--muted); line-height:1.7; }
+  .ev-explainer summary { cursor:pointer; color:#93c5fd; font-weight:bold; user-select:none; list-style:none; }
+  .ev-explainer summary::after { content:' ▾'; font-size:10px; }
+  .ev-explainer strong { color:var(--text); }
+  .ev-explainer em { color:#93c5fd; font-style:normal; }
 </style>
 </head>
 <body>
@@ -702,21 +717,47 @@ function renderEV() {
     return;
   }
 
-  list.innerHTML = filtered.map((b, i) => {
+  const explainer = `
+  <details class="ev-explainer">
+    <summary>How to read +EV bets</summary>
+    <div style="margin-top:8px">
+      <strong>Implied Prob (IV)</strong> — the book's offered odds converted to a probability. Lower IV = longer (better) odds for you. e.g. +459 American = 17.9% IV.<br>
+      <strong>Fair Prob</strong> — true probability estimated from ${(filtered[0]||{}).sharp_book||'the sharp book'} after removing its vig/juice. This is what the scanner believes the outcome is "really" worth.<br>
+      <strong>EV%</strong> — <em>(fair_prob × decimal_odds − 1) × 100</em>. At +8% EV, you earn an average of $8 per $100 staked over many bets. Results vary bet-to-bet — this is <strong>not guaranteed profit</strong>.<br>
+      <strong>Why EV% ≠ (Pinnacle IV − your IV)</strong> — Edge scales with the decimal odds. A 1% probability edge at 5× odds = 5% EV, not 1%. The formula accounts for how much you collect when you win.<br>
+      <strong>Half-Kelly</strong> — optimal bet size from the Kelly Criterion, halved for safety. Kelly = EV% ÷ (decimal_odds − 1). Uses your "Stake $" setting as your total betting bankroll.
+    </div>
+  </details>`;
+
+  list.innerHTML = explainer + filtered.map((b, i) => {
     const sport = (b.sport || '').replace(/_/g,' ').replace('americanfootball','football');
     const date = b.commence_time ? new Date(b.commence_time).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
     const evStr = '+' + b.ev_pct.toFixed(2) + '%';
     const evStake = b._maxBet || stake;
     const evDollars = (b.ev_pct / 100 * evStake).toFixed(2);
 
+    // Kelly criterion: f = EV / (decimal_odds - 1)  [fraction of bankroll]
+    const netOdds = b.leg.decimal_odds - 1;
+    const kellyFull = netOdds > 0 ? (b.ev_pct / 100) / netOdds : 0;
+    const kellyHalf = kellyFull / 2;
+    const kellyHalfPct = (kellyHalf * 100).toFixed(2);
+    const kellyFullPct = (kellyFull * 100).toFixed(2);
+    const kellyDollars = (kellyHalf * stake).toFixed(2);
+
+    const rawPct = b.sharp_raw_prob ? (b.sharp_raw_prob * 100).toFixed(1) + '%' : '';
+    const fairPct = (b.sharp_prob * 100).toFixed(1) + '%';
+    const sharpLine = rawPct && rawPct !== fairPct
+      ? `Raw IV: ${rawPct} → De-vigged: ${fairPct}`
+      : `Fair probability: ${fairPct}`;
+
     return `
-    <div class="opp-card is-arb">
+    <div class="opp-card is-ev">
       <div class="opp-head" onclick="toggle('evb${i}','evc${i}')">
         <span class="edge-badge pos">${evStr}</span>
         <span class="opp-name">${b.event_name} · ${b.leg.outcome}${b._boosted ? ' <span style="font-size:10px;color:var(--amber)">⚡</span>' : ''}</span>
         <span class="sport-tag">${sport}</span>
         <span class="source-tag sportsbook">+EV</span>
-        <span class="profit-chip">+$${evDollars}</span>
+        <span class="ev-chip">~+$${evDollars}/bet</span>
         <span class="chevron" id="evc${i}">›</span>
       </div>
       <div class="opp-body" id="evb${i}">
@@ -727,18 +768,22 @@ function renderEV() {
             <div class="leg-outcome">${b.leg.outcome}</div>
             ${b.leg._boost_note ? `<div class="leg-boost">⚡ ${b.leg._boost_note}</div>` : ''}
             <div class="leg-odds">${typeof b.leg.decimal_odds === 'number' ? b.leg.decimal_odds.toFixed(3) : b.leg.decimal_odds} <span style="font-size:11px;color:var(--muted)">(${b.leg.american_odds})</span></div>
-            <div class="leg-stake">Implied: ${(b.leg.implied_prob * 100).toFixed(1)}%</div>
+            <div class="leg-stake">Your IV: ${(b.leg.implied_prob * 100).toFixed(1)}%</div>
           </div>
           <div class="leg">
-            <div class="leg-book">${b.sharp_book} (fair line)</div>
-            <div class="leg-outcome">True probability</div>
-            <div class="leg-odds">${(b.sharp_prob * 100).toFixed(1)}%</div>
-            <div class="leg-stake">Your edge: +${b.ev_pct.toFixed(2)}%</div>
+            <div class="leg-book">${b.sharp_book} · sharp reference</div>
+            <div class="leg-outcome">Fair probability</div>
+            <div class="leg-odds" style="color:#93c5fd">${fairPct}</div>
+            <div class="leg-stake">${sharpLine}</div>
           </div>
         </div>
-        <div class="profit-bar">
-          <span class="pb-label">Expected value on $${evStake.toFixed(0)}${b._maxBet ? ' <span style="font-size:10px;color:var(--amber)">(max bet)</span>' : ''}</span>
-          <span class="pb-val">+$${evDollars}</span>
+        <div class="ev-bar">
+          <span class="pb-label">Avg expected profit per $${evStake.toFixed(0)} bet${b._maxBet ? ' <span style="font-size:10px;color:var(--amber)">(max bet)</span>' : ''} · not guaranteed</span>
+          <span class="pb-val">~+$${evDollars}</span>
+        </div>
+        <div class="kelly-bar">
+          <span class="pb-label">Half-Kelly bet on $${stake.toFixed(0)} bankroll · Full Kelly: ${kellyFullPct}% ($${(kellyFull*stake).toFixed(2)})</span>
+          <span class="pb-val">${kellyHalfPct}% = $${kellyDollars}</span>
         </div>
       </div>
     </div>`;

@@ -283,9 +283,10 @@ class PlusEVBet:
     sport: str
     commence_time: str
     leg: Leg
-    sharp_prob: float   # de-vigged true probability from sharp book
-    ev_pct: float       # (fair_prob * decimal_odds - 1) * 100
+    sharp_prob: float       # de-vigged true probability from sharp book
+    ev_pct: float           # (fair_prob * decimal_odds - 1) * 100
     sharp_book: str
+    sharp_raw_prob: float = 0.0  # raw Pinnacle/Lowvig implied prob before de-vig
 
     def to_dict(self) -> dict:
         return {
@@ -294,6 +295,7 @@ class PlusEVBet:
             "commence_time": self.commence_time,
             "leg": asdict(self.leg),
             "sharp_prob": self.sharp_prob,
+            "sharp_raw_prob": self.sharp_raw_prob,
             "ev_pct": self.ev_pct,
             "sharp_book": self.sharp_book,
             "source": "ev",
@@ -341,6 +343,7 @@ def find_plus_ev_bets(events: list[dict]) -> list[PlusEVBet]:
         if len(sharp_raw) < 2:
             continue
         names, probs = zip(*sharp_raw)
+        raw_dict = dict(zip(names, probs))          # raw implied probs before de-vig
         fair = dict(zip(names, _devig_probs(list(probs))))
 
         # Check every soft book for +EV pricing vs the fair line
@@ -371,6 +374,7 @@ def find_plus_ev_bets(events: list[dict]) -> list[PlusEVBet]:
                             sharp_prob=round(fair[name], 4),
                             ev_pct=round(ev_val * 100, 4),
                             sharp_book=sharp_title,
+                            sharp_raw_prob=round(raw_dict.get(name, 0.0), 4),
                         ))
     return results
 
