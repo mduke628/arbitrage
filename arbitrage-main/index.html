@@ -117,6 +117,13 @@
   .log-line { margin-bottom: 2px; }
   .log-line.ok { color: var(--green); }
   .log-line.err { color: var(--red); }
+
+  /* Boost chips */
+  .boost-chip { display:flex; align-items:flex-start; justify-content:space-between; background:var(--surface2); border:1px solid var(--border2); border-radius:5px; padding:5px 8px; font-size:11px; color:var(--text); margin-bottom:4px; }
+  .boost-chip .bc-info { flex:1; line-height:1.4; }
+  .boost-chip .bc-del { color:var(--muted); cursor:pointer; font-size:14px; margin-left:6px; flex-shrink:0; line-height:1; }
+  .boost-chip .bc-del:hover { color:var(--red); }
+  .leg-boost { font-size:10px; color:var(--amber); margin-top:2px; }
 </style>
 </head>
 <body>
@@ -155,6 +162,54 @@
           <input type="number" id="interval" value="60" min="15">
         </div>
         <button class="btn btn-outline" onclick="pushConfig()">Apply interval</button>
+      </div>
+
+      <hr class="divider">
+
+      <div>
+        <div class="section-label">Profit Boosts</div>
+        <div id="boostList"></div>
+        <div class="field">
+          <label>Book</label>
+          <select id="bBook">
+            <option value="">Any book</option>
+            <option>DraftKings</option>
+            <option>FanDuel</option>
+            <option>BetMGM</option>
+            <option>Caesars</option>
+            <option>BetRivers</option>
+            <option>Fanatics</option>
+            <option>Hard Rock Bet</option>
+            <option>BetParx</option>
+            <option>ESPN BET</option>
+            <option>Bally Bet</option>
+            <option>bet365</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Boost type</label>
+          <select id="bType" onchange="toggleBoostType()">
+            <option value="price">Fixed boosted price</option>
+            <option value="pct">% profit boost</option>
+          </select>
+        </div>
+        <div class="field" id="bPriceRow">
+          <label>Boosted odds (American, e.g. +500)</label>
+          <input type="text" id="bPrice" placeholder="+500">
+        </div>
+        <div class="field" id="bPctRow" style="display:none">
+          <label>Boost %</label>
+          <input type="number" id="bPct" placeholder="25" min="1" max="500">
+        </div>
+        <div class="field">
+          <label>Keyword – event or outcome (optional)</label>
+          <input type="text" id="bKeyword" placeholder="Lakers · Over 220.5 · etc.">
+        </div>
+        <div class="field">
+          <label>Min odds – American (optional)</label>
+          <input type="text" id="bMinOdds" placeholder="-200">
+        </div>
+        <button class="btn btn-outline" onclick="addBoost()">Add boost</button>
       </div>
 
       <hr class="divider">
@@ -330,8 +385,144 @@ function setTab(tab) {
 }
 
 function decToAmerican(dec) {
+  if (!dec || dec <= 1) return 'N/A';
   if (dec >= 2) return '+' + Math.round((dec - 1) * 100);
   return '' + Math.round(-100 / (dec - 1));
+}
+
+// ---------------------------------------------------------------------------
+// Boost management
+// ---------------------------------------------------------------------------
+
+let boosts = JSON.parse(localStorage.getItem('arb_boosts') || '[]');
+
+function saveBoosts() { localStorage.setItem('arb_boosts', JSON.stringify(boosts)); }
+
+function renderBoostList() {
+  const box = document.getElementById('boostList');
+  if (!boosts.length) {
+    box.innerHTML = '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">No boosts added.</div>';
+    return;
+  }
+  box.innerHTML = boosts.map((b, i) => {
+    const primary = b.type === 'price'
+      ? `${b.book || 'Any book'} → <strong>${b.boostedOdds}</strong>`
+      : `${b.book || 'Any book'} <strong>+${b.pct}% profit</strong>`;
+    const meta = [b.keyword ? `"${b.keyword}"` : '', b.minOdds ? `min ${b.minOdds}` : ''].filter(Boolean).join(' · ');
+    return `<div class="boost-chip">
+      <span class="bc-info">${primary}${meta ? `<br><span style="color:var(--muted);font-size:10px">${meta}</span>` : ''}</span>
+      <span class="bc-del" onclick="deleteBoost(${i})">×</span>
+    </div>`;
+  }).join('');
+}
+
+function toggleBoostType() {
+  const t = document.getElementById('bType').value;
+  document.getElementById('bPriceRow').style.display = t === 'price' ? '' : 'none';
+  document.getElementById('bPctRow').style.display   = t === 'pct'   ? '' : 'none';
+}
+
+function americanToDecimal(american) {
+  const n = parseFloat(String(american).replace(/\s/g, ''));
+  if (isNaN(n) || n === 0) return null;
+  return n > 0 ? (n / 100) + 1 : (100 / Math.abs(n)) + 1;
+}
+
+function addBoost() {
+  const type    = document.getElementById('bType').value;
+  const book    = document.getElementById('bBook').value.trim();
+  const keyword = document.getElementById('bKeyword').value.trim();
+  const minOdds = document.getElementById('bMinOdds').value.trim();
+
+  if (type === 'price') {
+    const raw = document.getElementById('bPrice').value.trim();
+    if (!raw) { log('Enter the boosted odds first', 'err'); return; }
+    if (!americanToDecimal(raw)) { log('Invalid odds — use American format e.g. +500 or -110', 'err'); return; }
+    boosts.push({ type: 'price', book, boostedOdds: raw, keyword, minOdds });
+  } else {
+    const pct = parseFloat(document.getElementById('bPct').value);
+    if (!pct || pct <= 0) { log('Enter a valid boost %', 'err'); return; }
+    boosts.push({ type: 'pct', book, pct, keyword, minOdds });
+  }
+
+  saveBoosts();
+  renderBoostList();
+  document.getElementById('bPrice').value   = '';
+  document.getElementById('bPct').value     = '';
+  document.getElementById('bKeyword').value = '';
+  document.getElementById('bMinOdds').value = '';
+  render();
+}
+
+function deleteBoost(i) {
+  boosts.splice(i, 1);
+  saveBoosts();
+  renderBoostList();
+  render();
+}
+
+function legPassesMinOdds(legDecimal, minOddsAmerican) {
+  if (!minOddsAmerican) return true;
+  const minDec = americanToDecimal(minOddsAmerican);
+  return minDec !== null && legDecimal >= minDec;
+}
+
+function findBoostForLeg(leg, event_name) {
+  return boosts.find(b => {
+    if (b.book && !leg.book.toLowerCase().includes(b.book.toLowerCase())) return false;
+    if (b.keyword) {
+      const kw = b.keyword.toLowerCase();
+      if (!event_name.toLowerCase().includes(kw) && !leg.outcome.toLowerCase().includes(kw)) return false;
+    }
+    if (!legPassesMinOdds(leg.decimal_odds, b.minOdds)) return false;
+    return true;
+  });
+}
+
+function applyBoostToLeg(leg, boost) {
+  let newDec;
+  let note;
+  if (boost.type === 'price') {
+    newDec = americanToDecimal(boost.boostedOdds);
+    note = `Boosted → ${boost.boostedOdds}`;
+  } else {
+    newDec = 1 + (leg.decimal_odds - 1) * (1 + boost.pct / 100);
+    note = `+${boost.pct}% boost → ${decToAmerican(newDec)}`;
+  }
+  if (!newDec || newDec <= 1) return leg;
+  return { ...leg, decimal_odds: newDec, american_odds: decToAmerican(newDec), implied_prob: 1 / newDec, _boost_note: note, _orig_odds: leg.american_odds };
+}
+
+function applyBoostsToOpp(opp) {
+  if (!boosts.length) return opp;
+  const newLegs = opp.legs.map(l => {
+    const b = findBoostForLeg(l, opp.event_name);
+    return b ? applyBoostToLeg(l, b) : l;
+  });
+  if (!newLegs.some(l => l._boost_note)) return opp;
+
+  const totalImpl = newLegs.reduce((s, l) => s + l.implied_prob, 0);
+  const edge = (1 - totalImpl) * 100;
+  const stakes1000 = newLegs.map(l => (1000 / totalImpl) * l.implied_prob);
+  const payout1000 = stakes1000[0] * newLegs[0].decimal_odds;
+  return {
+    ...opp, legs: newLegs,
+    total_implied: totalImpl,
+    edge_pct: Math.round(edge * 10000) / 10000,
+    is_arb: totalImpl < 1.0,
+    stakes_1000: stakes1000.map(s => Math.round(s * 100) / 100),
+    guaranteed_profit_1000: Math.round((payout1000 - 1000) * 100) / 100,
+    _boosted: true,
+  };
+}
+
+function applyBoostToEVBet(bet) {
+  if (!boosts.length) return bet;
+  const b = findBoostForLeg(bet.leg, bet.event_name);
+  if (!b) return bet;
+  const newLeg = applyBoostToLeg(bet.leg, b);
+  const evVal = bet.sharp_prob * newLeg.decimal_odds - 1;
+  return { ...bet, leg: newLeg, ev_pct: Math.round(evVal * 100 * 10000) / 10000, _boosted: true };
 }
 
 function isInTimeframe(commence_time, filter) {
@@ -372,11 +563,13 @@ function render() {
   const hideLive = document.getElementById('hideLive').checked;
   const roundMode = document.getElementById('stakeRound').value;
 
-  let filtered = allOpps.filter(o =>
-    o.edge_pct >= minEdge && o.is_arb &&
-    isInTimeframe(o.commence_time, timeFilter) &&
-    !(hideLive && isLiveBet(o.commence_time))
-  );
+  let filtered = allOpps
+    .map(applyBoostsToOpp)
+    .filter(o =>
+      o.edge_pct >= minEdge && o.is_arb &&
+      isInTimeframe(o.commence_time, timeFilter) &&
+      !(hideLive && isLiveBet(o.commence_time))
+    );
   if (src !== 'all') filtered = filtered.filter(o => o.source === src);
   filtered.sort((a, b) => b.edge_pct - a.edge_pct);
 
@@ -398,9 +591,10 @@ function render() {
 
     const legsHtml = (o.legs || []).map((l, li) => `
       <div class="leg">
-        <div class="leg-book">${l.book}</div>
+        <div class="leg-book">${l.book}${l._boost_note ? ` <span style="font-size:10px;color:var(--amber)">(${l._orig_odds})</span>` : ''}</div>
         <div class="leg-outcome">${l.outcome}</div>
         <div class="leg-odds">${typeof l.decimal_odds === 'number' ? l.decimal_odds.toFixed(3) : l.decimal_odds} <span style="font-size:11px;color:var(--muted)">(${l.american_odds})</span></div>
+        ${l._boost_note ? `<div class="leg-boost">⚡ ${l._boost_note}</div>` : ''}
         <div class="leg-stake">Stake: $${stakes[li] != null ? fmtStake(stakes[li]) : '—'}</div>
         ${l.market_url ? `<div style="margin-top:4px"><a href="${l.market_url}" style="font-size:11px;color:var(--blue)">View market ↗</a></div>` : ''}
       </div>`).join('');
@@ -413,7 +607,7 @@ function render() {
     <div class="opp-card ${isArb?'is-arb':''}">
       <div class="opp-head" onclick="toggle('ob${i}','oc${i}')">
         <span class="edge-badge ${isArb?'pos':'neg'}">${edgeStr}</span>
-        <span class="opp-name">${o.event_name}</span>
+        <span class="opp-name">${o.event_name}${o._boosted ? ' <span style="font-size:10px;color:var(--amber)">⚡</span>' : ''}</span>
         <span class="sport-tag">${sport}</span>
         <span class="source-tag ${o.source}">${o.source}</span>
         ${isArb ? `<span class="profit-chip">+$${fmtProfit(profit)}</span>` : ''}
@@ -434,11 +628,13 @@ function renderEV() {
   const timeFilter = document.getElementById('timeFilter').value;
   const hideLive = document.getElementById('hideLive').checked;
 
-  let filtered = allEVBets.filter(b =>
-    b.ev_pct >= minEdge &&
-    isInTimeframe(b.commence_time, timeFilter) &&
-    !(hideLive && isLiveBet(b.commence_time))
-  );
+  let filtered = allEVBets
+    .map(applyBoostToEVBet)
+    .filter(b =>
+      b.ev_pct >= minEdge &&
+      isInTimeframe(b.commence_time, timeFilter) &&
+      !(hideLive && isLiveBet(b.commence_time))
+    );
   filtered.sort((a, b) => b.ev_pct - a.ev_pct);
 
   const list = document.getElementById('oppList');
@@ -457,7 +653,7 @@ function renderEV() {
     <div class="opp-card is-arb">
       <div class="opp-head" onclick="toggle('evb${i}','evc${i}')">
         <span class="edge-badge pos">${evStr}</span>
-        <span class="opp-name">${b.event_name} · ${b.leg.outcome}</span>
+        <span class="opp-name">${b.event_name} · ${b.leg.outcome}${b._boosted ? ' <span style="font-size:10px;color:var(--amber)">⚡</span>' : ''}</span>
         <span class="sport-tag">${sport}</span>
         <span class="source-tag sportsbook">+EV</span>
         <span class="profit-chip">+$${evDollars}</span>
@@ -467,8 +663,9 @@ function renderEV() {
         ${date ? `<div class="commence">Starts: ${date}</div>` : ''}
         <div class="legs-grid">
           <div class="leg">
-            <div class="leg-book">${b.leg.book}</div>
+            <div class="leg-book">${b.leg.book}${b.leg._boost_note ? ` <span style="font-size:10px;color:var(--amber)">(${b.leg._orig_odds})</span>` : ''}</div>
             <div class="leg-outcome">${b.leg.outcome}</div>
+            ${b.leg._boost_note ? `<div class="leg-boost">⚡ ${b.leg._boost_note}</div>` : ''}
             <div class="leg-odds">${typeof b.leg.decimal_odds === 'number' ? b.leg.decimal_odds.toFixed(3) : b.leg.decimal_odds} <span style="font-size:11px;color:var(--muted)">(${b.leg.american_odds})</span></div>
             <div class="leg-stake">Implied: ${(b.leg.implied_prob * 100).toFixed(1)}%</div>
           </div>
@@ -494,6 +691,9 @@ function toggle(bodyId, chevId) {
   const open = b.classList.toggle('open');
   c.classList.toggle('open', open);
 }
+
+// Init
+renderBoostList();
 </script>
 </body>
 </html>
