@@ -195,6 +195,20 @@
           <option value="kalshi">Kalshi</option>
           <option value="cross">Cross-market</option>
         </select>
+        <label>Time</label>
+        <select id="timeFilter" onchange="render()" style="width:auto">
+          <option value="all">All dates</option>
+          <option value="today">Today</option>
+          <option value="tomorrow">Today &amp; tomorrow</option>
+          <option value="week">Next 7 days</option>
+        </select>
+        <label style="cursor:pointer"><input type="checkbox" id="hideLive" onchange="render()" checked style="margin-right:3px;accent-color:var(--green)">Hide live</label>
+        <label>Rounding</label>
+        <select id="stakeRound" onchange="render()" style="width:auto">
+          <option value="exact">Exact</option>
+          <option value="1">Nearest $1</option>
+          <option value="5">Nearest $5</option>
+        </select>
       </div>
 
       <div id="errorBanner" class="error-banner" style="display:none"></div>
@@ -320,13 +334,49 @@ function decToAmerican(dec) {
   return '' + Math.round(-100 / (dec - 1));
 }
 
+function isInTimeframe(commence_time, filter) {
+  if (filter === 'all' || !commence_time) return true;
+  const t = new Date(commence_time);
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const dayMs = 86400000;
+  if (filter === 'today')    return t >= todayStart && t < new Date(+todayStart + dayMs);
+  if (filter === 'tomorrow') return t >= todayStart && t < new Date(+todayStart + 2 * dayMs);
+  if (filter === 'week')     return t >= todayStart && t < new Date(+todayStart + 7 * dayMs);
+  return true;
+}
+
+function isLiveBet(commence_time) {
+  return commence_time ? new Date(commence_time) < new Date() : false;
+}
+
+function roundedArbStakes(o, stake, mode) {
+  const rawStakes = o.stakes_1000 ? o.stakes_1000.map(s => s * stake / 1000) : [];
+  if (mode === 'exact') {
+    return { stakes: rawStakes, profit: o.guaranteed_profit_1000 != null ? o.guaranteed_profit_1000 * stake / 1000 : 0 };
+  }
+  const mult = mode === '5' ? 5 : 1;
+  const rounded = rawStakes.map(s => Math.round(s / mult) * mult);
+  const total = rounded.reduce((a, b) => a + b, 0);
+  const payouts = rounded.map((s, i) => s * ((o.legs && o.legs[i]) ? o.legs[i].decimal_odds : 1));
+  const profit = (payouts.length ? Math.min(...payouts) : 0) - total;
+  return { stakes: rounded, profit };
+}
+
 function render() {
   if (currentTab === 'ev') { renderEV(); return; }
   const minEdge = parseFloat(document.getElementById('minEdge').value) || 0;
   const stake = parseFloat(document.getElementById('stake').value) || 1000;
   const src = document.getElementById('srcFilter').value;
+  const timeFilter = document.getElementById('timeFilter').value;
+  const hideLive = document.getElementById('hideLive').checked;
+  const roundMode = document.getElementById('stakeRound').value;
 
-  let filtered = allOpps.filter(o => o.edge_pct >= minEdge && o.is_arb);
+  let filtered = allOpps.filter(o =>
+    o.edge_pct >= minEdge && o.is_arb &&
+    isInTimeframe(o.commence_time, timeFilter) &&
+    !(hideLive && isLiveBet(o.commence_time))
+  );
   if (src !== 'all') filtered = filtered.filter(o => o.source === src);
   filtered.sort((a, b) => b.edge_pct - a.edge_pct);
 
@@ -342,20 +392,21 @@ function render() {
     const sport = (o.sport || '').replace(/_/g,' ').replace('americanfootball','football');
     const date = o.commence_time ? new Date(o.commence_time).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
 
-    const stakes = o.stakes_1000 ? o.stakes_1000.map(s => (s * stake / 1000)) : [];
-    const profit = o.guaranteed_profit_1000 != null ? (o.guaranteed_profit_1000 * stake / 1000) : 0;
+    const { stakes, profit } = roundedArbStakes(o, stake, roundMode);
+    const fmtStake  = s => roundMode === 'exact' ? s.toFixed(2) : s.toFixed(0);
+    const fmtProfit = p => p.toFixed(2);
 
     const legsHtml = (o.legs || []).map((l, li) => `
       <div class="leg">
         <div class="leg-book">${l.book}</div>
         <div class="leg-outcome">${l.outcome}</div>
         <div class="leg-odds">${typeof l.decimal_odds === 'number' ? l.decimal_odds.toFixed(3) : l.decimal_odds} <span style="font-size:11px;color:var(--muted)">(${l.american_odds})</span></div>
-        <div class="leg-stake">Stake: $${stakes[li] ? stakes[li].toFixed(2) : '—'}</div>
+        <div class="leg-stake">Stake: $${stakes[li] != null ? fmtStake(stakes[li]) : '—'}</div>
         ${l.market_url ? `<div style="margin-top:4px"><a href="${l.market_url}" style="font-size:11px;color:var(--blue)">View market ↗</a></div>` : ''}
       </div>`).join('');
 
     const profitSection = isArb
-      ? `<div class="profit-bar"><span class="pb-label">Guaranteed profit on $${stake.toFixed(0)}</span><span class="pb-val">+$${profit.toFixed(2)}</span></div>`
+      ? `<div class="profit-bar"><span class="pb-label">Guaranteed profit on $${stake.toFixed(0)}</span><span class="pb-val">+$${fmtProfit(profit)}</span></div>`
       : `<div class="no-arb-bar">Book margin: ${(-o.edge_pct).toFixed(2)}% · No arb at current odds</div>`;
 
     return `
@@ -365,7 +416,7 @@ function render() {
         <span class="opp-name">${o.event_name}</span>
         <span class="sport-tag">${sport}</span>
         <span class="source-tag ${o.source}">${o.source}</span>
-        ${isArb ? `<span class="profit-chip">+$${profit.toFixed(2)}</span>` : ''}
+        ${isArb ? `<span class="profit-chip">+$${fmtProfit(profit)}</span>` : ''}
         <span class="chevron" id="oc${i}">›</span>
       </div>
       <div class="opp-body" id="ob${i}">
@@ -380,8 +431,14 @@ function render() {
 function renderEV() {
   const minEdge = parseFloat(document.getElementById('minEdge').value) || 0;
   const stake = parseFloat(document.getElementById('stake').value) || 1000;
+  const timeFilter = document.getElementById('timeFilter').value;
+  const hideLive = document.getElementById('hideLive').checked;
 
-  let filtered = allEVBets.filter(b => b.ev_pct >= minEdge);
+  let filtered = allEVBets.filter(b =>
+    b.ev_pct >= minEdge &&
+    isInTimeframe(b.commence_time, timeFilter) &&
+    !(hideLive && isLiveBet(b.commence_time))
+  );
   filtered.sort((a, b) => b.ev_pct - a.ev_pct);
 
   const list = document.getElementById('oppList');
