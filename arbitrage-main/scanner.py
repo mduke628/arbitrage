@@ -81,15 +81,33 @@ def implied_prob(decimal_odds: float) -> float:
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-# All bookmakers available on free/paid tiers
-BOOKMAKERS = [
-    # NJ-legal sportsbooks with supported The Odds API bookmaker keys
-    "draftkings", "fanduel", "betmgm", "williamhill_us", "betrivers",
-    "fanatics", "hardrockbet", "betparx", "espnbet", "ballybet", "bet365",
-    "pinnacle", "lowvig",
+# Books the user can actually bet on — only these are used as arb legs.
+BETTABLE_BOOKS = [
+    "draftkings",      # DraftKings
+    "fanduel",         # FanDuel
+    "betmgm",          # BetMGM
+    "borgataonline",   # Borgata Sports (BetMGM-powered; key unconfirmed — drop if 422)
+    "williamhill_us",  # Caesars Sportsbook (legacy key for Caesars US)
+    "betrivers",       # BetRivers
+    "fanatics",        # Fanatics
+    "bet365",          # bet365
+    "hardrockbet",     # Hard Rock Bet
+    "espnbet",         # ESPN BET (formerly theScore Bet US)
+    "betparx",         # BetParx
+    "ballybet",        # Bally Bet
+    "sporttrade",      # Sporttrade exchange (NJ/PA; key unconfirmed — drop if 422)
+    # Note: Kalshi is fetched separately via its own API, not The Odds API.
+    # Note: PrimeSports does not appear to have an Odds API key.
 ]
 
+# Sharp-line reference books — used ONLY for +EV de-vig, never as arb legs.
 SHARP_BOOKS = ["pinnacle", "lowvig"]
+
+# All bookmakers sent to The Odds API (bettable + sharp for EV reference).
+BOOKMAKERS = BETTABLE_BOOKS + SHARP_BOOKS
+
+# Fast-lookup set used by parse functions to exclude sharp books from arb legs.
+_BETTABLE_SET = set(BETTABLE_BOOKS)
 
 SPORTS = [
     # American Football
@@ -434,6 +452,8 @@ def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
     best: dict[tuple, tuple[float, str]] = {}
 
     for bm in event_data.get("bookmakers", []):
+        if bm.get("key") not in _BETTABLE_SET:
+            continue
         for mkt in bm.get("markets", []):
             player = mkt.get("description", "Unknown Player")
             mkt_key = mkt["key"]
@@ -528,6 +548,8 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
         # are genuinely complementary, so grouping by raw point is correct.
         best: dict[tuple, tuple[float, str]] = {}
         for bm in ev.get("bookmakers", []):
+            if bm.get("key") not in _BETTABLE_SET:
+                continue
             for mkt in bm.get("markets", []):
                 mkt_type = mkt["key"]
                 if mkt_type not in ("h2h", "totals"):
@@ -573,6 +595,8 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
         # pair each negative-point leg with the opposing team's positive-point leg.
         spread_best: dict[tuple, tuple[float, str]] = {}
         for bm in ev.get("bookmakers", []):
+            if bm.get("key") not in _BETTABLE_SET:
+                continue
             for mkt in bm.get("markets", []):
                 if mkt["key"] != "spreads":
                     continue
