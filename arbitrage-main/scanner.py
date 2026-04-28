@@ -273,8 +273,28 @@ PLAYER_PROP_MARKETS: dict[str, list[str]] = {
 # ---------------------------------------------------------------------------
 
 def _devig_probs(raw_probs: list[float]) -> list[float]:
-    total = sum(raw_probs)
-    return [p / total for p in raw_probs] if total > 0 else raw_probs
+    """Power de-vig: find k > 1 s.t. Σ(p_i^k) = 1, then fair_p_i = p_i^k.
+
+    Unlike multiplicative de-vig (divide by sum), this applies proportionally
+    more margin removal to underdogs — matching how bookmakers actually distribute
+    vig and preventing longshot inflation in EV calculations.
+    """
+    if sum(raw_probs) <= 1.0:
+        return raw_probs
+
+    # Binary search for k in (1, 20): f(k) = Σ(p_i^k) is strictly decreasing.
+    # At k=1 the sum equals the raw overround (> 1); at k=20 it's near 0.
+    lo, hi = 1.0, 20.0
+    for _ in range(64):
+        k = (lo + hi) / 2
+        if sum(p ** k for p in raw_probs) > 1.0:
+            lo = k
+        else:
+            hi = k
+
+    result = [p ** k for p in raw_probs]
+    total = sum(result)
+    return [r / total for r in result]  # normalize to correct float drift
 
 
 @dataclass
