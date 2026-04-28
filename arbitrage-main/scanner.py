@@ -219,54 +219,6 @@ SPORTS = [
     "darts_betway_premier_league",
 ]
 
-# Player prop market keys supported by The Odds API, keyed by sport.
-# Only sports listed here will have their per-event prop endpoints queried.
-# Only over/under markets are included — every entry here produces "Over"/"Under"
-# outcomes with a numeric point line. Yes/No props (anytime TD, first basket,
-# double-double, goal scorer, method of victory, cards) are excluded.
-PLAYER_PROP_MARKETS: dict[str, list[str]] = {
-    "americanfootball_nfl": [
-        "player_pass_tds", "player_pass_yds", "player_pass_completions",
-        "player_pass_attempts", "player_pass_interceptions", "player_pass_longest_completion",
-        "player_rush_yds", "player_rush_attempts", "player_rush_longest",
-        "player_receptions", "player_reception_yds", "player_reception_longest",
-        "player_kicking_points", "player_field_goals",
-    ],
-    "americanfootball_ncaaf": [
-        "player_pass_tds", "player_pass_yds", "player_rush_yds", "player_reception_yds",
-    ],
-    "basketball_nba": [
-        "player_points", "player_rebounds", "player_assists", "player_threes",
-        "player_blocks", "player_steals", "player_turnovers",
-        "player_points_rebounds_assists", "player_points_rebounds",
-        "player_points_assists", "player_rebounds_assists",
-    ],
-    "basketball_ncaab": [
-        "player_points", "player_rebounds", "player_assists", "player_threes",
-    ],
-    "basketball_wnba": [
-        "player_points", "player_rebounds", "player_assists", "player_threes",
-    ],
-    "baseball_mlb": [
-        "player_strikeouts", "player_hits_allowed", "player_earned_runs", "player_walks",
-        "player_total_bases", "player_hits", "player_rbis", "player_runs_scored",
-        "player_hits_runs_rbis", "player_home_runs", "player_stolen_bases",
-    ],
-    "icehockey_nhl": [
-        "player_points", "player_goals", "player_assists",
-        "player_shots_on_goal", "player_saves",
-    ],
-    "soccer_epl": [
-        "player_shots_on_target",
-    ],
-    "soccer_usa_mls": [
-        "player_shots_on_target",
-    ],
-    "soccer_uefa_champs_league": [
-        "player_shots_on_target",
-    ],
-}
-
 
 # ---------------------------------------------------------------------------
 # +EV detection
@@ -419,115 +371,6 @@ async def fetch_all_active_sports(session: aiohttp.ClientSession, api_key: str) 
         print(f"  [odds-api] Could not fetch sport list ({e}), using built-in list")
         return SPORTS
 
-
-async def fetch_sport_events(session: aiohttp.ClientSession, api_key: str, sport: str) -> list[dict]:
-    """Return upcoming event objects (with id, home_team, etc.) for a sport."""
-    url = f"{ODDS_API_BASE}/sports/{sport}/events?apiKey={api_key}"
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status in (401, 422):
-                return []
-            if resp.status != 200:
-                print(f"  [props] {sport} events: HTTP {resp.status}")
-                return []
-            return await resp.json()
-    except Exception as e:
-        print(f"  [props] {sport} events: {e}")
-        return []
-
-
-async def fetch_event_player_props(
-    session: aiohttp.ClientSession,
-    api_key: str,
-    sport: str,
-    event_id: str,
-    prop_markets: list[str],
-) -> Optional[dict]:
-    """Fetch player prop odds for one event. Returns the raw event object or None."""
-    books = ",".join(BOOKMAKERS)
-    markets = ",".join(prop_markets)
-    url = (
-        f"{ODDS_API_BASE}/sports/{sport}/events/{event_id}/odds"
-        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets={markets}"
-        f"&oddsFormat=decimal&bookmakers={books}"
-    )
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status != 200:
-                return None
-            return await resp.json()
-    except Exception:
-        return None
-
-
-def parse_player_props(event_data: dict) -> list[ArbOpportunity]:
-    """
-    Parse a per-event odds response that contains player prop markets.
-    Each market has a 'description' field with the player name. We group
-    by (market_key, player, point) and find the best price per outcome
-    across all books, then check for arb.
-    """
-    results = []
-    base_name = f"{event_data.get('home_team','?')} vs {event_data.get('away_team','?')}"
-    sport = event_data.get("sport_key", "")
-    commence_time = event_data.get("commence_time", "")
-
-    # best[(market_key, player_name, point_str, outcome_name)] = (decimal_odds, book_title)
-    best: dict[tuple, tuple[float, str]] = {}
-
-    for bm in event_data.get("bookmakers", []):
-        if bm.get("key") not in _BETTABLE_SET:
-            continue
-        for mkt in bm.get("markets", []):
-            player = mkt.get("description", "Unknown Player")
-            mkt_key = mkt["key"]
-            for out in mkt.get("outcomes", []):
-                point = out.get("point")
-                point_str = str(point) if point is not None else ""
-                raw_outcome = str(out.get("name", "")).strip()
-                outcome_lower = raw_outcome.lower()
-                normalized_outcome = (
-                    "Over" if outcome_lower.startswith("over") else
-                    "Under" if outcome_lower.startswith("under") else
-                    raw_outcome
-                )
-                key = (mkt_key, player, point_str, normalized_outcome)
-                price = out["price"]
-                if key not in best or price > best[key][0]:
-                    best[key] = (price, bm["title"])
-
-    # Re-group into (market_key, player, point_str) -> legs
-    groups: dict[tuple, list[Leg]] = {}
-    for (mkt_key, player, point_str, outcome), (dec, book) in best.items():
-        groups.setdefault((mkt_key, player, point_str), []).append(Leg(
-            book=book,
-            outcome=outcome,
-            decimal_odds=dec,
-            american_odds=decimal_to_american(dec),
-            implied_prob=implied_prob(dec),
-        ))
-
-    for (mkt_key, player, point_str), legs in groups.items():
-        if len(legs) < 2:
-            continue
-        # Hard guard: skip anything that isn't a numeric over/under line
-        if {l.outcome for l in legs} != {"Over", "Under"} or not point_str:
-            continue
-        total_impl = sum(l.implied_prob for l in legs)
-        edge = (1 - total_impl) * 100
-        prop_label = mkt_key.replace("player_", "").replace("_", " ").title()
-        suffix = f" {point_str}" if point_str else ""
-        results.append(ArbOpportunity(
-            event_name=f"{base_name} · {player} {prop_label}{suffix}",
-            sport=sport,
-            commence_time=commence_time,
-            legs=legs,
-            total_implied=total_impl,
-            edge_pct=round(edge, 4),
-            is_arb=total_impl < 1.0,
-            source="props",
-        ))
-    return results
 
 
 async def fetch_sport_odds(session: aiohttp.ClientSession, api_key: str, sport: str) -> list[dict]:
@@ -922,34 +765,7 @@ async def scan(
                         books_seen.add(leg.book)
                 ev_bets.extend(find_plus_ev_bets(res))
 
-        # Player props — two-step: event IDs first, then per-event prop odds
-        prop_opps: list[ArbOpportunity] = []
-        if odds_api_key:
-            prop_sports = [s for s in sports if s in PLAYER_PROP_MARKETS]
-            if prop_sports:
-                print(f"  [props] Fetching event lists for {len(prop_sports)} sport(s)...")
-                event_lists = await asyncio.gather(
-                    *[fetch_sport_events(session, odds_api_key, sp) for sp in prop_sports],
-                    return_exceptions=True,
-                )
-                prop_tasks = []
-                for sp, events in zip(prop_sports, event_lists):
-                    if isinstance(events, Exception) or not events:
-                        continue
-                    prop_markets = PLAYER_PROP_MARKETS[sp]
-                    for ev in events:
-                        prop_tasks.append(
-                            fetch_event_player_props(session, odds_api_key, sp, ev["id"], prop_markets)
-                        )
-                if prop_tasks:
-                    print(f"  [props] Fetching props for {len(prop_tasks)} event(s)...")
-                    prop_results = await asyncio.gather(*prop_tasks, return_exceptions=True)
-                    for res in prop_results:
-                        if res and not isinstance(res, Exception):
-                            prop_opps.extend(parse_player_props(res))
-                    print(f"  [props] {len(prop_opps)} player prop markets found")
-
-        all_opps = sb_opps + kalshi_opps + prop_opps
+        all_opps = sb_opps + kalshi_opps
 
         if include_cross_market and sb_opps and kalshi_opps:
             cross = find_cross_market_arbs(sb_opps, kalshi_opps)
