@@ -511,7 +511,7 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 # ---------------------------------------------------------------------------
 
 KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
-KALSHI_FEE  = 0.07   # 7% of net profit charged on all settled contracts
+KALSHI_FEE_COEF = 0.07  # taker fee: $0.07 × C × (1−C) per $1 contract, where C = price in dollars
 
 async def fetch_kalshi_markets(session: aiohttp.ClientSession, api_key: str) -> list[ArbOpportunity]:
     """
@@ -580,14 +580,12 @@ def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
         if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
             continue
 
-        # Raw decimal odds: pay X cents, collect 100 cents if correct
-        yes_raw = 100 / yes_ask
-        no_raw  = 100 / no_ask
-
-        # Apply Kalshi's 7% fee on net profit:
-        #   effective_dec = 1 + (raw_dec - 1) * (1 - KALSHI_FEE)
-        yes_dec = 1 + (yes_raw - 1) * (1 - KALSHI_FEE)
-        no_dec  = 1 + (no_raw  - 1) * (1 - KALSHI_FEE)
+        # Kalshi taker fee: $0.07 × c × (1−c) per $1 contract, where c = price in dollars.
+        # Net payout per $1 contract = $1 − fee; effective decimal = net_payout / cost.
+        c_yes = yes_ask / 100
+        c_no  = no_ask  / 100
+        yes_dec = (1 - KALSHI_FEE_COEF * c_yes * (1 - c_yes)) / c_yes
+        no_dec  = (1 - KALSHI_FEE_COEF * c_no  * (1 - c_no )) / c_no
 
         total_impl = implied_prob(yes_dec) + implied_prob(no_dec)
         edge = (1 - total_impl) * 100
