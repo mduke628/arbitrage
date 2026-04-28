@@ -736,7 +736,7 @@ function renderEV() {
       <strong>Fair Prob</strong> — true probability estimated from ${(filtered[0]||{}).sharp_book||'the sharp book'} after removing its vig/juice. This is what the scanner believes the outcome is "really" worth.<br>
       <strong>EV%</strong> — <em>(fair_prob × decimal_odds − 1) × 100</em>. At +8% EV, you earn an average of $8 per $100 staked over many bets. Results vary bet-to-bet — this is <strong>not guaranteed profit</strong>.<br>
       <strong>Why EV% ≠ (Pinnacle IV − your IV)</strong> — Edge scales with the decimal odds. A 1% probability edge at 5× odds = 5% EV, not 1%. The formula accounts for how much you collect when you win.<br>
-      <strong>Half-Kelly</strong> — optimal bet size from the Kelly Criterion, halved for safety. Kelly = EV% ÷ (decimal_odds − 1). Uses your "Bankroll $" setting as your total available capital.
+      <strong>25% Kelly</strong> — recommended bet size at one-quarter of full Kelly. Kelly = EV% ÷ (decimal_odds − 1). Uses your "Bankroll $" setting as your total available capital.
     </div>
   </details>`;
 
@@ -750,7 +750,7 @@ function renderEV() {
     // Kelly criterion: f = EV / (decimal_odds - 1)  [fraction of bankroll]
     const netOdds = b.leg.decimal_odds - 1;
     const kellyFull = netOdds > 0 ? (b.ev_pct / 100) / netOdds : 0;
-    const kellyHalf = kellyFull / 2;
+    const kellyHalf = kellyFull / 4;
     const kellyHalfPct = (kellyHalf * 100).toFixed(2);
     const kellyFullPct = (kellyFull * 100).toFixed(2);
     const kellyDollars = (kellyHalf * bankroll).toFixed(2);
@@ -793,7 +793,7 @@ function renderEV() {
           <span class="pb-val">~+$${evDollars}</span>
         </div>
         <div class="kelly-bar">
-          <span class="pb-label">Half-Kelly bet on $${bankroll.toFixed(0)} bankroll · Full Kelly: ${kellyFullPct}% ($${(kellyFull*bankroll).toFixed(2)})</span>
+          <span class="pb-label">25% Kelly bet on $${bankroll.toFixed(0)} bankroll · Full Kelly: ${kellyFullPct}% ($${(kellyFull*bankroll).toFixed(2)})</span>
           <span class="pb-val">${kellyHalfPct}% = $${kellyDollars}</span>
         </div>
       </div>
