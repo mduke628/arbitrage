@@ -510,22 +510,42 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 # Kalshi API  (prediction markets)
 # ---------------------------------------------------------------------------
 
-KALSHI_AUTH_BASE = "https://trading-api.kalshi.com/trade-api/v2"
-KALSHI_PUBLIC_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_FEE  = 0.07   # 7% of net profit charged on all settled contracts
 
-async def kalshi_login(session: aiohttp.ClientSession, email: str, password: str) -> str:
-    """Exchange Kalshi email/password for a session token."""
-    url = f"{KALSHI_AUTH_BASE}/login"
-    payload = {"email": email, "password": password}
-    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-        if resp.status != 200:
-            raise ValueError(f"Kalshi login failed (HTTP {resp.status})")
-        data = await resp.json()
-        token = data.get("token")
-        if not token:
-            raise ValueError("Kalshi login response missing token")
-        print("  [kalshi] Login successful")
-        return token
+async def fetch_kalshi_markets(session: aiohttp.ClientSession, api_key: str) -> list[ArbOpportunity]:
+    """
+    Fetch active binary markets from Kalshi using an API key.
+    Paginates via cursor until all open markets are retrieved.
+    """
+    headers = {"Authorization": api_key, "Content-Type": "application/json"}
+    markets: list[dict] = []
+    cursor: str | None = None
+
+    while True:
+        url = f"{KALSHI_BASE}/markets?limit=1000&status=open"
+        if cursor:
+            url += f"&cursor={cursor}"
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status == 401:
+                    raise ValueError("Kalshi API key invalid or unauthorized")
+                if resp.status != 200:
+                    print(f"  [kalshi] HTTP {resp.status}")
+                    break
+                data = await resp.json()
+        except Exception as e:
+            print(f"  [kalshi] error: {e}")
+            break
+
+        markets.extend(data.get("markets", []))
+        cursor = data.get("cursor") or None
+        if not cursor:
+            break
+
+    sports_markets = [m for m in markets if _looks_like_sports_market(m)]
+    print(f"  [kalshi] {len(markets)} open markets ({len(sports_markets)} sports-like)")
+    return parse_kalshi_markets(sports_markets)
 
 
 def _looks_like_sports_market(market: dict) -> bool:
@@ -550,71 +570,42 @@ def _looks_like_sports_market(market: dict) -> bool:
     return any(token in text for token in sports_tokens)
 
 
-async def fetch_kalshi_markets(session: aiohttp.ClientSession, kalshi_token: str) -> list[ArbOpportunity]:
-    """
-    Fetch active binary markets from Kalshi and model each YES/NO as a two-leg opportunity.
-    Kalshi YES + NO prices should sum to ~$1.00 (100 cents). If they sum to < $1.00, arb exists.
-    """
-    bases = [KALSHI_AUTH_BASE, KALSHI_PUBLIC_BASE]
-    errors = []
-
-    for base in bases:
-        url = f"{base}/markets?limit=200&status=open"
-        headers = {"Content-Type": "application/json"}
-        if kalshi_token and base == KALSHI_AUTH_BASE:
-            headers["Authorization"] = f"Bearer {kalshi_token}"
-
-        try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    errors.append(f"{base} HTTP {resp.status}")
-                    continue
-
-                data = await resp.json()
-                markets = data.get("markets", [])
-                sports_markets = [m for m in markets if _looks_like_sports_market(m)]
-                print(
-                    f"  [kalshi] fetched {len(markets)} open markets "
-                    f"({len(sports_markets)} sports-like) from {base}"
-                )
-                return parse_kalshi_markets(sports_markets)
-        except Exception as e:
-            errors.append(f"{base} {e}")
-
-    if errors:
-        print(f"  [kalshi] all endpoints failed: {'; '.join(errors)}")
-    return []
-
-
 def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
     results = []
     for m in markets:
         yes_ask = m.get("yes_ask")   # cents — price to BUY yes
-        no_ask = m.get("no_ask")    # cents — price to BUY no
+        no_ask  = m.get("no_ask")    # cents — price to BUY no
         if yes_ask is None or no_ask is None:
             continue
         if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
             continue
 
-        # Convert cents to decimal odds: pay X cents to win 100 cents
-        yes_dec = 100 / yes_ask
-        no_dec = 100 / no_ask
-        total_impl = (yes_ask / 100) + (no_ask / 100)
+        # Raw decimal odds: pay X cents, collect 100 cents if correct
+        yes_raw = 100 / yes_ask
+        no_raw  = 100 / no_ask
+
+        # Apply Kalshi's 7% fee on net profit:
+        #   effective_dec = 1 + (raw_dec - 1) * (1 - KALSHI_FEE)
+        yes_dec = 1 + (yes_raw - 1) * (1 - KALSHI_FEE)
+        no_dec  = 1 + (no_raw  - 1) * (1 - KALSHI_FEE)
+
+        total_impl = implied_prob(yes_dec) + implied_prob(no_dec)
         edge = (1 - total_impl) * 100
 
+        ticker = m.get("ticker", "")
         legs = [
             Leg(book="Kalshi", outcome="YES", decimal_odds=round(yes_dec, 4),
                 american_odds=decimal_to_american(yes_dec),
-                implied_prob=yes_ask / 100,
-                market_url=f"https://kalshi.com/markets/{m.get('ticker','')}"),
+                implied_prob=implied_prob(yes_dec),
+                market_url=f"https://kalshi.com/markets/{ticker}"),
             Leg(book="Kalshi", outcome="NO", decimal_odds=round(no_dec, 4),
                 american_odds=decimal_to_american(no_dec),
-                implied_prob=no_ask / 100,
-                market_url=f"https://kalshi.com/markets/{m.get('ticker','')}"),
+                implied_prob=implied_prob(no_dec),
+                market_url=f"https://kalshi.com/markets/{ticker}"),
         ]
 
         results.append(ArbOpportunity(
-            event_name=m.get("title", m.get("ticker", "Unknown")),
+            event_name=m.get("title", ticker or "Unknown"),
             sport="prediction_market",
             commence_time=m.get("close_time", ""),
             legs=legs,
@@ -705,9 +696,7 @@ class ScanResult:
 
 async def scan(
     odds_api_key: str = "",
-    kalshi_token: str = "",
-    kalshi_email: str = "",
-    kalshi_password: str = "",
+    kalshi_api_key: str = "",
     sports: Optional[list[str]] = None,
     arbs_only: bool = False,
     min_edge: float = 0.0,
@@ -718,13 +707,6 @@ async def scan(
     errors: list[str] = []
 
     async with aiohttp.ClientSession() as session:
-        # Auto-login to Kalshi if email/password provided (UUID key alone is not a bearer token)
-        if kalshi_email and kalshi_password and not kalshi_token:
-            try:
-                kalshi_token = await kalshi_login(session, kalshi_email, kalshi_password)
-            except Exception as e:
-                errors.append(f"Kalshi login: {e}")
-
         # Resolve sport list — fetch all active sports from API when none specified
         if not sports and odds_api_key:
             sports = await fetch_all_active_sports(session, odds_api_key)
@@ -738,8 +720,8 @@ async def scan(
                 tasks.append(fetch_sport_odds(session, odds_api_key, sport))
 
         kalshi_task = None
-        if kalshi_token:
-            kalshi_task = fetch_kalshi_markets(session, kalshi_token)
+        if kalshi_api_key:
+            kalshi_task = fetch_kalshi_markets(session, kalshi_api_key)
 
         print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_task else '0 Kalshi'} requests...")
         t0 = time.time()
@@ -801,7 +783,7 @@ async def scan(
 
 async def run_loop(
     odds_api_key: str = "",
-    kalshi_token: str = "",
+    kalshi_api_key: str = "",
     interval_seconds: int = 60,
     min_edge: float = 0.0,
     on_result=None,   # callback(ScanResult)
@@ -813,7 +795,7 @@ async def run_loop(
         try:
             result = await scan(
                 odds_api_key=odds_api_key,
-                kalshi_token=kalshi_token,
+                kalshi_api_key=kalshi_api_key,
                 sports=sports,
                 min_edge=min_edge,
             )
@@ -834,7 +816,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Arbitrage Scanner")
     parser.add_argument("--odds-key", default=os.getenv("ODDS_API_KEY", ""), help="The Odds API key")
-    parser.add_argument("--kalshi-token", default=os.getenv("KALSHI_API_TOKEN", ""), help="Kalshi API token")
+    parser.add_argument("--kalshi-key", default=os.getenv("KALSHI_API_KEY", ""), help="Kalshi API key")
     parser.add_argument("--min-edge", type=float, default=0.0, help="Minimum edge %% to display")
     parser.add_argument("--arbs-only", action="store_true", help="Only show arbs")
     parser.add_argument("--output", choices=["table", "json"], default="table")
@@ -859,18 +841,18 @@ if __name__ == "__main__":
 
     async def main():
         if args.output == "json":
-            result = await scan(odds_api_key=args.odds_key, kalshi_token=args.kalshi_token, min_edge=args.min_edge)
+            result = await scan(odds_api_key=args.odds_key, kalshi_api_key=args.kalshi_key, min_edge=args.min_edge)
             print(result.to_json())
         elif args.loop:
             await run_loop(
                 odds_api_key=args.odds_key,
-                kalshi_token=args.kalshi_token,
+                kalshi_api_key=args.kalshi_key,
                 interval_seconds=args.interval,
                 min_edge=args.min_edge,
                 on_result=print_result,
             )
         else:
-            result = await scan(odds_api_key=args.odds_key, kalshi_token=args.kalshi_token, min_edge=args.min_edge)
+            result = await scan(odds_api_key=args.odds_key, kalshi_api_key=args.kalshi_key, min_edge=args.min_edge)
             print_result(result)
 
     asyncio.run(main())
