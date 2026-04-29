@@ -748,10 +748,10 @@ function renderEV() {
     // Kelly criterion: f = EV / (decimal_odds - 1)  [fraction of bankroll]
     const netOdds = b.leg.decimal_odds - 1;
     const kellyFull = netOdds > 0 ? (b.ev_pct / 100) / netOdds : 0;
-    const kellyHalf = kellyFull / 4;
-    const kellyHalfPct = (kellyHalf * 100).toFixed(2);
+    const kellyQuarter = kellyFull / 4;
+    const kellyQuarterPct = (kellyQuarter * 100).toFixed(2);
     const kellyFullPct = (kellyFull * 100).toFixed(2);
-    const kellyDollars = (kellyHalf * bankroll).toFixed(2);
+    const kellyDollars = (kellyQuarter * bankroll).toFixed(2);
 
     const rawPct = b.sharp_raw_prob ? (b.sharp_raw_prob * 100).toFixed(1) + '%' : '';
     const fairPct = (b.sharp_prob * 100).toFixed(1) + '%';
@@ -792,7 +792,7 @@ function renderEV() {
         </div>
         <div class="kelly-bar">
           <span class="pb-label">25% Kelly bet on $${bankroll.toFixed(0)} bankroll · Full Kelly: ${kellyFullPct}% ($${(kellyFull*bankroll).toFixed(2)})</span>
-          <span class="pb-val">${kellyHalfPct}% = $${kellyDollars}</span>
+          <span class="pb-val">${kellyQuarterPct}% = $${kellyDollars}</span>
         </div>
       </div>
     </div>`;
