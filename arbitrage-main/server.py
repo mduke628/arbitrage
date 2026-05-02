@@ -21,17 +21,20 @@ import aiohttp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Load .env from the same directory as this file, if present.
+# override=True ensures .env values win over any stale OS-level env vars.
 try:
     from dotenv import load_dotenv
     _env = Path(__file__).parent / ".env"
     if _env.exists():
-        load_dotenv(_env)
+        load_dotenv(_env, override=True)
         print(f"[server] Loaded environment from {_env}")
+    else:
+        print(f"[server] No .env file found at {_env} — using OS environment only")
 except ImportError:
-    pass
+    print("[server] python-dotenv not installed — reading keys from OS environment only")
 
 from scanner import scan, run_loop, ScanResult, SPORTS, place_kalshi_order
 
@@ -40,17 +43,23 @@ from scanner import scan, run_loop, ScanResult, SPORTS, place_kalshi_order
 # ---------------------------------------------------------------------------
 
 class Config(BaseModel):
-    odds_api_key:     str   = os.getenv("ODDS_API_KEY",   "")
-    kalshi_api_key:   str   = os.getenv("KALSHI_API_KEY", "")
-    interval_seconds: int   = int(os.getenv("SCAN_INTERVAL", "60"))
-    min_edge:         float = float(os.getenv("MIN_EDGE", "0.0"))
+    # Use default_factory so os.getenv is called at instantiation time, not at class-definition
+    # time. This guarantees load_dotenv has already run when the values are read.
+    odds_api_key:     str   = Field(default_factory=lambda: os.getenv("ODDS_API_KEY",   ""))
+    kalshi_api_key:   str   = Field(default_factory=lambda: os.getenv("KALSHI_API_KEY", ""))
+    interval_seconds: int   = Field(default_factory=lambda: int(os.getenv("SCAN_INTERVAL", "60")))
+    min_edge:         float = Field(default_factory=lambda: float(os.getenv("MIN_EDGE", "0.0")))
     arbs_only:        bool  = False
-    sports:           list[str] = []   # empty = fetch all active from API
-    bankroll:         float = float(os.getenv("BANKROLL", "1000.0"))
-    auto_trade:       bool  = os.getenv("AUTO_TRADE", "false").lower() == "true"
-    ev_threshold:     float = float(os.getenv("EV_THRESHOLD", "5.0"))  # min EV% to auto-trade
+    sports:           list[str] = Field(default_factory=list)
+    bankroll:         float = Field(default_factory=lambda: float(os.getenv("BANKROLL", "1000.0")))
+    auto_trade:       bool  = Field(default_factory=lambda: os.getenv("AUTO_TRADE", "false").lower() == "true")
+    ev_threshold:     float = Field(default_factory=lambda: float(os.getenv("EV_THRESHOLD", "5.0")))
 
 config = Config()
+
+# Print key-configuration status at startup so problems are obvious in the log.
+print(f"[server] ODDS_API_KEY   : {'SET (' + str(len(config.odds_api_key)) + ' chars)' if config.odds_api_key else 'NOT SET — add ODDS_API_KEY=... to your .env'}")
+print(f"[server] KALSHI_API_KEY : {'SET (' + str(len(config.kalshi_api_key)) + ' chars)' if config.kalshi_api_key else 'NOT SET — add KALSHI_API_KEY=... to your .env'}")
 last_result: ScanResult | None = None
 ws_clients: list[WebSocket] = []
 
@@ -192,7 +201,10 @@ async def status():
 @app.get("/scan")
 async def trigger_scan():
     if not config.odds_api_key and not config.kalshi_api_key:
-        return JSONResponse(status_code=400, content={"error": "No API keys configured."})
+        return JSONResponse(status_code=400, content={
+            "error": "No API keys configured.",
+            "fix": "Add ODDS_API_KEY and/or KALSHI_API_KEY to your .env file, then restart the server.",
+        })
     result = await scan(
         odds_api_key=config.odds_api_key,
         kalshi_api_key=config.kalshi_api_key,
