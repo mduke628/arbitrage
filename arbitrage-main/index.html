@@ -330,15 +330,22 @@ function setStatus(connected) {
   document.getElementById('statusTxt').textContent = connected ? 'live' : 'disconnected';
 }
 
+let _reconnectTimer = null;
+
 function connect() {
   if (ws) { ws.close(); ws = null; }
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
   const base = document.getElementById('serverUrl').value.replace(/\/$/, '');
   const wsUrl = base.replace(/^http/, 'ws') + '/ws';
   log('Connecting to ' + wsUrl);
   try {
     ws = new WebSocket(wsUrl);
     ws.onopen = () => { setStatus(true); log('Connected', 'ok'); };
-    ws.onclose = () => { setStatus(false); log('Disconnected'); ws = null; };
+    ws.onclose = () => {
+      setStatus(false); ws = null;
+      log('Disconnected — retrying in 5s...');
+      _reconnectTimer = setTimeout(connect, 5000);
+    };
     ws.onerror = () => { log('WebSocket error — is the server running?', 'err'); };
     ws.onmessage = (e) => {
       try {
@@ -843,6 +850,7 @@ function toggle(bodyId, chevId) {
 
 // Init
 renderBoostList();
+connect();
 </script>
 </body>
 </html>
