@@ -490,6 +490,9 @@ async def fetch_sport_odds(session: aiohttp.ClientSession, api_key: str, sport: 
         return []
 
 
+# Empty set — no bettable sportsbooks configured; all execution goes through Kalshi.
+_BETTABLE_SET: set[str] = set()
+
 _MARKET_LABELS = {"h2h": "ML", "spreads": "Spread", "totals": "Total"}
 
 def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
@@ -617,7 +620,7 @@ def _kalshi_rsa_headers(method: str, path: str, api_key: str) -> dict:
         msg,
         _asym_padding.PSS(
             mgf=_asym_padding.MGF1(hashes.SHA256()),
-            salt_length=_asym_padding.PSS.DIGEST_LENGTH,
+            salt_length=_asym_padding.PSS.MAX_LENGTH,
         ),
         hashes.SHA256(),
     )
