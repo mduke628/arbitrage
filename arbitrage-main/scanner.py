@@ -892,7 +892,7 @@ def find_kalshi_ev_bets(
     matched = unmatched = 0
 
     def _make_ev_bet(km, ticker, side, ask_cents, fair_p, outcome_label,
-                     sharp_title, commence_time) -> Optional[PlusEVBet]:
+                     sharp_title, commence_time, auto_trade=True) -> Optional[PlusEVBet]:
         c = ask_cents / 100
         dec = (1 - KALSHI_FEE_COEF * c * (1 - c)) / c
         ev = fair_p * dec - 1
@@ -914,9 +914,12 @@ def find_kalshi_ev_bets(
             sharp_prob=round(fair_p, 4),
             ev_pct=round(ev * 100, 4),
             sharp_book=sharp_title,
-            kalshi_ticker=ticker,
-            kalshi_side=side,
-            kalshi_ask_cents=ask_cents,
+            # Only populate auto-trade fields when the point matched exactly.
+            # Approximate matches (different reference line) display in the UI
+            # but are excluded from auto-trading via the empty ticker check.
+            kalshi_ticker=ticker if auto_trade else "",
+            kalshi_side=side if auto_trade else "",
+            kalshi_ask_cents=ask_cents if auto_trade else 0,
         )
 
     for km in kalshi_raw:
@@ -986,12 +989,14 @@ def find_kalshi_ev_bets(
             # Opposite direction at the same sharp point
             no_fair = best_ref["fair_totals"].get((sharp_pt_yes, opp), 1.0 - yes_fair)
 
-            ref_note = f" (ref {sharp_pt_yes})" if sharp_pt_yes != pt else ""
+            exact = (sharp_pt_yes == pt)
+            ref_note = f" (ref {sharp_pt_yes} — display only)" if not exact else ""
             for s, ask, fp, lbl in [
                 ("yes", yes_ask, yes_fair, f"YES — {side.title()} {pt}{ref_note}"),
                 ("no",  no_ask,  no_fair,  f"NO  — {opp.title()} {pt}{ref_note}"),
             ]:
-                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time)
+                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time,
+                                   auto_trade=exact)
                 if bet:
                     results.append(bet)
 
@@ -1039,12 +1044,14 @@ def find_kalshi_ev_bets(
                 no_fair = 1.0 - yes_fair
                 no_team = "Opp"
 
-            ref_note = f" (ref ±{sharp_pt_spread})" if sharp_pt_spread != pt else ""
+            exact = (sharp_pt_spread == pt)
+            ref_note = f" (ref ±{sharp_pt_spread} — display only)" if not exact else ""
             for s, ask, fp, lbl in [
                 ("yes", yes_ask, yes_fair, f"YES — {yes_team} by >{pt}{ref_note}"),
                 ("no",  no_ask,  no_fair,  f"NO  — {no_team} covers +{pt}{ref_note}"),
             ]:
-                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time)
+                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time,
+                                   auto_trade=exact)
                 if bet:
                     results.append(bet)
 
