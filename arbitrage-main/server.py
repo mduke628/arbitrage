@@ -29,7 +29,7 @@ try:
     from dotenv import load_dotenv
     _env = Path(__file__).parent / ".env"
     if _env.exists():
-        load_dotenv(_env, override=True)
+        load_dotenv(_env, override=True, encoding="utf-8-sig")  # utf-8-sig strips Windows BOM if present
         print(f"[server] Loaded environment from {_env}")
     else:
         print(f"[server] No .env file found at {_env} — using OS environment only")
