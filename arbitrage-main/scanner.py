@@ -959,58 +959,90 @@ def find_kalshi_ev_bets(
         mkt_meta = _parse_kalshi_mkt(km_title)
 
         # ── TOTAL market ──────────────────────────────────────────────────────
+        # Kalshi total lines are adjustable in ~3-point increments, so we find
+        # the nearest sharp total within MAX_TOTAL_GAP. Power de-vig is applied
+        # at the sharp book's actual line, not Kalshi's displayed point.
         if mkt_meta and mkt_meta["type"] == "total":
             pt   = mkt_meta["point"]
             side = mkt_meta["side"]       # "over" or "under"
             opp  = "under" if side == "over" else "over"
-            yes_fair = best_ref["fair_totals"].get((pt, side))
-            no_fair  = best_ref["fair_totals"].get((pt, opp))
-            if yes_fair is None and no_fair is None:
+
+            MAX_TOTAL_GAP = 9.0  # allow up to 3 Kalshi increments (3 pts each)
+
+            # Nearest sharp total in the same direction (over or under)
+            yes_fair = sharp_pt_yes = None
+            best_d = float("inf")
+            for (spt, ss), fp in best_ref["fair_totals"].items():
+                if ss != side:
+                    continue
+                d = abs(spt - pt)
+                if d < best_d:
+                    best_d = d
+                    yes_fair = fp
+                    sharp_pt_yes = spt
+            if yes_fair is None or best_d > MAX_TOTAL_GAP:
                 continue
-            if yes_fair is None and no_fair is not None:
-                yes_fair = 1.0 - no_fair
-            if no_fair is None and yes_fair is not None:
-                no_fair = 1.0 - yes_fair
-            for s, ask, fp, lbl in [("yes", yes_ask, yes_fair, f"YES — {side.title()} {pt}"),
-                                     ("no",  no_ask,  no_fair,  f"NO  — {opp.title()} {pt}")]:
+
+            # Opposite direction at the same sharp point
+            no_fair = best_ref["fair_totals"].get((sharp_pt_yes, opp), 1.0 - yes_fair)
+
+            ref_note = f" (ref {sharp_pt_yes})" if sharp_pt_yes != pt else ""
+            for s, ask, fp, lbl in [
+                ("yes", yes_ask, yes_fair, f"YES — {side.title()} {pt}{ref_note}"),
+                ("no",  no_ask,  no_fair,  f"NO  — {opp.title()} {pt}{ref_note}"),
+            ]:
                 bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time)
                 if bet:
                     results.append(bet)
 
         # ── SPREAD market ─────────────────────────────────────────────────────
+        # Kalshi spread markets step in ~3-point increments. We find the nearest
+        # sharp line for the same team within MAX_SPREAD_GAP and use its power-
+        # de-vigged fair probability as the EV reference.
         elif mkt_meta and mkt_meta["type"] == "spread":
-            pt        = mkt_meta["point"]   # Kalshi always states a positive number
-            team_hint = mkt_meta["team"]    # lowercase partial team name from title
-            # Find the full team name in the sharp spreads that matches the hint
-            # and has this exact point value (negative = favourite covers).
+            pt        = mkt_meta["point"]   # positive number from Kalshi title
+            team_hint = mkt_meta["team"]    # lowercase partial team name
+
+            MAX_SPREAD_GAP = 9.0  # up to 3 increments
+
             yes_team = no_team = None
             yes_fair = no_fair = None
+            sharp_pt_spread = None
+            best_d = float("inf")
+
             for (sbook_team, sbook_pt), fp in best_ref["fair_spreads"].items():
                 team_lower = sbook_team.lower()
-                # "boston" hint matches "Boston Celtics"
-                last_word = sbook_team.split()[-1].lower() if sbook_team else ""
-                if (team_hint in team_lower or last_word in team_hint or team_hint in last_word):
-                    if abs(abs(sbook_pt) - pt) < 0.26:  # same line (allow 0.25 rounding)
-                        yes_fair = fp
-                        yes_team = sbook_team
-                        # NO = the other team covering at +pt
-                        opp_key = next(
-                            ((t, p) for (t, p), _ in best_ref["fair_spreads"].items()
-                             if t != sbook_team and abs(abs(p) - pt) < 0.26),
-                            None,
-                        )
-                        if opp_key:
-                            no_fair = best_ref["fair_spreads"][opp_key]
-                            no_team = opp_key[0]
-                        else:
-                            no_fair = 1.0 - yes_fair
-                            no_team = "Opp"
-                        break
-            if yes_fair is None:
+                last_word  = sbook_team.split()[-1].lower() if sbook_team else ""
+                if not (team_hint in team_lower or last_word in team_hint or team_hint in last_word):
+                    continue
+                # sbook_pt is negative for the favourite; Kalshi pt is positive
+                d = abs(abs(sbook_pt) - pt)
+                if d < best_d:
+                    best_d       = d
+                    yes_fair     = fp
+                    yes_team     = sbook_team
+                    sharp_pt_spread = abs(sbook_pt)
+
+            if yes_fair is None or best_d > MAX_SPREAD_GAP:
                 continue
+
+            # NO side = the other team covering at the same line
+            opp_entry = next(
+                ((t, p) for (t, p) in best_ref["fair_spreads"]
+                 if t != yes_team and abs(abs(p) - sharp_pt_spread) < 0.26),
+                None,
+            )
+            if opp_entry:
+                no_fair = best_ref["fair_spreads"][opp_entry]
+                no_team = opp_entry[0]
+            else:
+                no_fair = 1.0 - yes_fair
+                no_team = "Opp"
+
+            ref_note = f" (ref ±{sharp_pt_spread})" if sharp_pt_spread != pt else ""
             for s, ask, fp, lbl in [
-                ("yes", yes_ask, yes_fair, f"YES — {yes_team} by >{pt}"),
-                ("no",  no_ask,  no_fair,  f"NO  — {no_team} covers +{pt}"),
+                ("yes", yes_ask, yes_fair, f"YES — {yes_team} by >{pt}{ref_note}"),
+                ("no",  no_ask,  no_fair,  f"NO  — {no_team} covers +{pt}{ref_note}"),
             ]:
                 bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time)
                 if bet:
