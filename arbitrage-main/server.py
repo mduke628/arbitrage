@@ -15,12 +15,23 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import aiohttp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+# Load .env from the same directory as this file, if present.
+try:
+    from dotenv import load_dotenv
+    _env = Path(__file__).parent / ".env"
+    if _env.exists():
+        load_dotenv(_env)
+        print(f"[server] Loaded environment from {_env}")
+except ImportError:
+    pass
 
 from scanner import scan, run_loop, ScanResult, SPORTS, place_kalshi_order
 

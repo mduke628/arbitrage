@@ -1,18 +1,37 @@
 """
 Arbitrage Scanner - Core Engine
-Fetches odds from The Odds API (sportsbooks) and Kalshi (prediction markets),
-detects arbitrage opportunities, and ranks them by edge.
+Fetches odds from The Odds API (sharp books only: Pinnacle, Bookmaker, Circa)
+and Kalshi (prediction markets). Detects +EV Kalshi contracts vs. the averaged
+sharp line, and submits limit orders automatically when EV >= threshold.
 """
 
 import asyncio
 import aiohttp
+import base64
 import json
 import re
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Optional
 from datetime import datetime, timezone
+
+# RSA auth for Kalshi — loaded once at module init from private_key.pem
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding as _asym_padding
+    _CRYPTO_OK = True
+except ImportError:
+    _CRYPTO_OK = False
+
+_PRIVATE_KEY_BYTES: Optional[bytes] = None
+_pem_path = Path(__file__).parent / "private_key.pem"
+if _pem_path.exists():
+    _PRIVATE_KEY_BYTES = _pem_path.read_bytes()
+    print("[kalshi] RSA private key loaded — using KALSHI-ACCESS-SIGNATURE auth")
+else:
+    print("[kalshi] No private_key.pem found — falling back to bearer token auth")
 
 
 # ---------------------------------------------------------------------------
@@ -83,34 +102,15 @@ def implied_prob(decimal_odds: float) -> float:
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
-# Books the user can actually bet on — only these are used as arb legs.
-BETTABLE_BOOKS = [
-    "draftkings",      # DraftKings
-    "fanduel",         # FanDuel
-    "betmgm",          # BetMGM
-    "borgataonline",   # Borgata Sports (BetMGM-powered; key unconfirmed — drop if 422)
-    "williamhill_us",  # Caesars Sportsbook (legacy key for Caesars US)
-    "betrivers",       # BetRivers
-    "fanatics",        # Fanatics
-    "bet365",          # bet365
-    "hardrockbet",     # Hard Rock Bet
-    "espnbet",         # ESPN BET (formerly theScore Bet US)
-    "betparx",         # BetParx
-    "ballybet",        # Bally Bet
-    "sporttrade",      # Sporttrade exchange (NJ/PA; key unconfirmed — drop if 422)
-    # Note: Kalshi is fetched separately via its own API, not The Odds API.
-    # Note: PrimeSports does not appear to have an Odds API key.
-]
-
-# Sharp-line reference books — used ONLY for +EV de-vig, never as arb legs.
-# Averaging across multiple sharp books reduces noise in fair-line estimation.
+# Sharp reference books — used ONLY for de-vig / fair-line estimation.
+# Kalshi is the only book we actually bet on; these are price references only.
+# Averaging across all three reduces noise vs. using a single book.
 SHARP_BOOKS = ["pinnacle", "bookmaker", "circa_sports"]
-
-# All bookmakers sent to The Odds API (bettable + sharp for EV reference).
-BOOKMAKERS = BETTABLE_BOOKS + SHARP_BOOKS
-
-# Fast-lookup set used by parse functions to exclude sharp books from arb legs.
-_BETTABLE_SET = set(BETTABLE_BOOKS)
+SHARP_BOOK_LABELS = {
+    "pinnacle":    "Pinnacle",
+    "bookmaker":   "Bookmaker.eu",
+    "circa_sports":"Circa Sports",
+}
 
 SPORTS = [
     # American Football
@@ -320,7 +320,12 @@ def _avg_sharp_fair(bookmakers: list[dict]) -> tuple[dict[str, float], dict[str,
 
     fair = {n: sum(ps) / len(ps) for n, ps in all_fair.items()}
     raw  = {n: sum(ps) / len(ps) for n, ps in all_raw.items()}
-    label = " / ".join(dict.fromkeys(titles_seen))  # deduplicated, ordered
+    n_books = len(set(titles_seen))
+    unique_titles = list(dict.fromkeys(titles_seen))
+    if n_books > 1:
+        label = f"Avg({', '.join(unique_titles)})"
+    else:
+        label = unique_titles[0]
     return fair, raw, label
 
 
@@ -396,10 +401,12 @@ async def fetch_all_active_sports(session: aiohttp.ClientSession, api_key: str) 
 
 
 async def fetch_sport_odds(session: aiohttp.ClientSession, api_key: str, sport: str) -> list[dict]:
-    books = ",".join(BOOKMAKERS)
+    # Only request the three sharp reference books — massive API quota saving
+    # vs. fetching 15+ bettable books we no longer need.
+    books = ",".join(SHARP_BOOKS)
     url = (
         f"{ODDS_API_BASE}/sports/{sport}/odds/"
-        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets=h2h,spreads,totals"
+        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets=h2h"
         f"&oddsFormat=decimal&bookmakers={books}"
     )
     try:
@@ -535,19 +542,43 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
 KALSHI_FEE_COEF = 0.07  # taker fee: $0.07 × C × (1−C) per $1 contract, where C = price in dollars
 
+
+def _kalshi_headers(method: str, path: str, api_key: str) -> dict:
+    """
+    Return Kalshi authentication headers.
+    Prefers RSA-SHA256 (KALSHI-ACCESS-SIGNATURE) when private_key.pem is present;
+    falls back to simple bearer token otherwise.
+    The path argument should be just the URL path, no domain, no query string.
+    """
+    if _PRIVATE_KEY_BYTES and _CRYPTO_OK:
+        ts_ms = str(int(time.time() * 1000))
+        msg = ts_ms + method.upper() + path
+        pk = serialization.load_pem_private_key(_PRIVATE_KEY_BYTES, password=None)
+        sig = pk.sign(msg.encode(), _asym_padding.PKCS1v15(), hashes.SHA256())
+        return {
+            "KALSHI-ACCESS-KEY": api_key,
+            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+            "Content-Type": "application/json",
+        }
+    # Bearer token fallback
+    return {"Authorization": api_key, "Content-Type": "application/json"}
+
+
 async def fetch_kalshi_raw(session: aiohttp.ClientSession, api_key: str) -> list[dict]:
     """
     Fetch all open Kalshi markets, paginating via cursor.
     Returns raw market dicts filtered to sports-like markets.
     """
-    headers = {"Authorization": api_key, "Content-Type": "application/json"}
     markets: list[dict] = []
     cursor: Optional[str] = None
+    path = "/trade-api/v2/markets"
 
     while True:
         url = f"{KALSHI_BASE}/markets?limit=1000&status=open"
         if cursor:
             url += f"&cursor={cursor}"
+        headers = _kalshi_headers("GET", path, api_key)
         try:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 if resp.status == 401:
@@ -649,10 +680,63 @@ def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
 
 _STOP_WORDS = {"the", "a", "an", "vs", "at", "in", "of", "to", "for",
                "will", "win", "game", "who", "which", "team", "over",
-               "under", "next", "be", "on", "by", "is", "are"}
+               "under", "next", "be", "on", "by", "is", "are", "and",
+               "not", "no", "yes", "beat", "defeat", "take", "series"}
 
 def _title_tokens(text: str) -> set[str]:
     return set(re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()) - _STOP_WORDS
+
+
+def _match_score(km_title: str, km_tokens: set[str], ref: dict) -> int:
+    """
+    Score how well a Kalshi market title matches a sportsbook event reference.
+    Higher is better; 0 means no match.
+    Uses substring matching on full team names AND token overlap on short names.
+    """
+    score = 0
+    km_lower = km_title.lower()
+    for team in (ref["home"], ref["away"]):
+        if not team:
+            continue
+        # Full team name as substring (highest confidence)
+        if team.lower() in km_lower:
+            score += 6
+            continue
+        # Last word of team name = mascot/city identifier (e.g. "Lakers")
+        parts = team.split()
+        if parts:
+            last = parts[-1].lower()
+            if len(last) > 3 and last in km_lower:
+                score += 3
+                continue
+        # Token overlap fallback
+        score += len(km_tokens & _title_tokens(team))
+    return score
+
+
+def _map_yes_to_team(km_title: str, km_tokens: set[str], fair: dict) -> tuple[Optional[str], float]:
+    """
+    Determine which sportsbook outcome corresponds to Kalshi YES by scoring
+    each outcome name against the market title. Returns (team_name, fair_prob).
+    """
+    km_lower = km_title.lower()
+    best_team, best_fair, best_score = None, 0.0, -1
+    for outcome_name, fair_p in fair.items():
+        score = 0
+        if outcome_name.lower() in km_lower:
+            score += 6
+        else:
+            parts = outcome_name.split()
+            if parts:
+                last = parts[-1].lower()
+                if len(last) > 3 and last in km_lower:
+                    score += 3
+            score += len(km_tokens & _title_tokens(outcome_name))
+        if score > best_score:
+            best_score = score
+            best_team = outcome_name
+            best_fair = fair_p
+    return (best_team, best_fair) if best_score > 0 else (None, 0.0)
 
 
 def find_kalshi_ev_bets(
@@ -662,13 +746,13 @@ def find_kalshi_ev_bets(
     """
     Cross-reference Kalshi markets against sharp sportsbook lines to find +EV
     contracts. Only considers pre-game markets (game not yet started).
-    YES/NO is mapped to a team by overlapping token matching on the market title.
+    Matching uses full-name substring search + last-word + token overlap,
+    so short Kalshi titles like "Will the Lakers win?" still match correctly.
     """
     now = datetime.now(timezone.utc)
     results: list[PlusEVBet] = []
 
     # Pre-compute sharp fair probs for every sportsbook event.
-    # Store alongside the home/away tokens for fast matching.
     sharp_refs: list[dict] = []
     for ev in sportsbook_events:
         home = ev.get("home_team", "")
@@ -683,12 +767,12 @@ def find_kalshi_ev_bets(
         sharp_refs.append({
             "home": home,
             "away": away,
-            "tokens": _title_tokens(f"{home} {away}"),
-            "fair": fair,           # {outcome_name: fair_prob}
+            "fair": fair,
             "sharp_title": sharp_title,
             "commence_time": commence_time,
         })
 
+    matched = 0
     for km in kalshi_raw:
         ticker = km.get("ticker", "")
         yes_ask = km.get("yes_ask")
@@ -698,22 +782,21 @@ def find_kalshi_ev_bets(
         if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
             continue
 
-        km_tokens = _title_tokens(km.get("title", ""))
-        if not km_tokens:
-            continue
+        km_title = km.get("title", ticker)
+        km_tokens = _title_tokens(km_title)
 
-        # Find best-matching sportsbook event by token overlap.
-        best_ref = None
-        best_overlap = 1  # require at least 2 overlapping tokens
+        # Find the sportsbook event that best matches this Kalshi title.
+        best_ref, best_score = None, 0
         for ref in sharp_refs:
-            overlap = len(km_tokens & ref["tokens"])
-            if overlap > best_overlap:
-                best_overlap = overlap
+            s = _match_score(km_title, km_tokens, ref)
+            if s > best_score:
+                best_score = s
                 best_ref = ref
 
-        if best_ref is None:
+        if best_ref is None or best_score == 0:
             continue
 
+        matched += 1
         # Skip live bets (game already started).
         try:
             ct = datetime.fromisoformat(best_ref["commence_time"].replace("Z", "+00:00"))
@@ -725,22 +808,10 @@ def find_kalshi_ev_bets(
         fair = best_ref["fair"]
         sharp_title = best_ref["sharp_title"]
         commence_time = best_ref["commence_time"]
-        km_title = km.get("title", ticker)
 
-        # Map YES to whichever sportsbook outcome name has the most token overlap
-        # with the Kalshi market title (e.g. "Will the Lakers win?" → Lakers).
-        yes_team: Optional[str] = None
-        yes_fair: float = 0.0
-        best_team_overlap = 0
-        for outcome_name in fair:
-            team_tokens = _title_tokens(outcome_name)
-            ov = len(km_tokens & team_tokens)
-            if ov > best_team_overlap:
-                best_team_overlap = ov
-                yes_team = outcome_name
-                yes_fair = fair[outcome_name]
-
-        if yes_team is None or best_team_overlap == 0:
+        # Map YES to the matching team outcome.
+        yes_team, yes_fair = _map_yes_to_team(km_title, km_tokens, fair)
+        if yes_team is None:
             continue
 
         no_fair = 1.0 - yes_fair  # binary market
@@ -797,6 +868,8 @@ def find_kalshi_ev_bets(
                 kalshi_ask_cents=no_ask,
             ))
 
+    if sharp_refs:
+        print(f"  [kalshi-ev] matched {matched}/{len(kalshi_raw)} markets to sharp refs → {len(results)} +EV bets")
     return results
 
 
@@ -809,7 +882,8 @@ async def place_kalshi_order(
     limit_cents: int,   # limit price in cents (max you'll pay per contract)
 ) -> dict:
     """Place a limit buy order on Kalshi. Returns {"status": http_code, ...}."""
-    headers = {"Authorization": api_key, "Content-Type": "application/json"}
+    path = "/trade-api/v2/portfolio/orders"
+    headers = _kalshi_headers("POST", path, api_key)
     client_id = f"autobet-{ticker[:20]}-{side}-{uuid.uuid4().hex[:8]}"
     # yes_price + no_price should approximately sum to 100 for a limit order.
     yes_price = limit_cents if side == "yes" else (100 - limit_cents)
