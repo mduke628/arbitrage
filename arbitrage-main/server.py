@@ -4,9 +4,10 @@ Run with: uvicorn server:app --reload --port 8000
 
 Endpoints:
   GET  /scan          - one-shot scan, returns JSON
-  GET  /status        - last scan result
+  GET  /status        - last scan result + auto-trade log
   WS   /ws            - websocket, pushes new results every interval
   POST /config        - update API keys / settings at runtime
+  GET  /trade-log     - recent auto-trade actions
 """
 
 import asyncio
@@ -15,28 +16,112 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import aiohttp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from scanner import scan, run_loop, ScanResult, SPORTS
+from scanner import scan, run_loop, ScanResult, SPORTS, place_kalshi_order
 
 # ---------------------------------------------------------------------------
 # Config (loaded from env or set via /config)
 # ---------------------------------------------------------------------------
 
 class Config(BaseModel):
-    odds_api_key:   str = os.getenv("ODDS_API_KEY",   "e4e92b78d437e818a1af0355704c4de9")
-    kalshi_api_key: str = os.getenv("KALSHI_API_KEY", "8b8ae9ee-a48d-4da8-ab18-f9a32d8c990e")
-    interval_seconds: int = int(os.getenv("SCAN_INTERVAL", "60"))
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.0"))
-    arbs_only: bool = False
-    sports: list[str] = []  # empty = scanner fetches all active sports from API at runtime
+    odds_api_key:     str   = os.getenv("ODDS_API_KEY",   "e4e92b78d437e818a1af0355704c4de9")
+    kalshi_api_key:   str   = os.getenv("KALSHI_API_KEY", "8b8ae9ee-a48d-4da8-ab18-f9a32d8c990e")
+    interval_seconds: int   = int(os.getenv("SCAN_INTERVAL", "60"))
+    min_edge:         float = float(os.getenv("MIN_EDGE", "0.0"))
+    arbs_only:        bool  = False
+    sports:           list[str] = []   # empty = fetch all active from API
+    bankroll:         float = float(os.getenv("BANKROLL", "1000.0"))
+    auto_trade:       bool  = os.getenv("AUTO_TRADE", "false").lower() == "true"
+    ev_threshold:     float = float(os.getenv("EV_THRESHOLD", "5.0"))  # min EV% to auto-trade
 
 config = Config()
 last_result: ScanResult | None = None
 ws_clients: list[WebSocket] = []
+
+# Tracks (ticker, side) pairs already ordered this session to avoid duplicates.
+placed_orders: set[tuple[str, str]] = set()
+# Last 50 auto-trade actions for the /trade-log endpoint.
+trade_log: list[dict] = []
+
+# ---------------------------------------------------------------------------
+# Kalshi auto-trading
+# ---------------------------------------------------------------------------
+
+async def auto_trade_kalshi(result: ScanResult) -> None:
+    """
+    For each +EV Kalshi bet in the scan result that exceeds the EV threshold,
+    place a 25%-Kelly limit order if we haven't already ordered it this session.
+    Live bets are excluded by find_kalshi_ev_bets (commence_time check).
+    """
+    if not config.auto_trade or not config.kalshi_api_key:
+        return
+
+    qualifying = [
+        b for b in result.ev_bets
+        if b.ev_pct >= config.ev_threshold
+        and b.kalshi_ticker
+        and b.kalshi_side
+        and (b.kalshi_ticker, b.kalshi_side) not in placed_orders
+    ]
+    if not qualifying:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        for bet in qualifying:
+            dec = bet.leg.decimal_odds
+            net_odds = dec - 1
+            if net_odds <= 0:
+                continue
+
+            kelly_full    = (bet.ev_pct / 100) / net_odds
+            kelly_quarter = kelly_full / 4
+            stake         = kelly_quarter * config.bankroll
+            count         = max(1, int(stake / (bet.kalshi_ask_cents / 100)))
+
+            print(
+                f"[auto-trade] {bet.kalshi_side.upper()} {count}c "
+                f"on {bet.kalshi_ticker} @ {bet.kalshi_ask_cents}¢  "
+                f"EV={bet.ev_pct:.2f}%  Kelly={kelly_quarter*100:.2f}%  "
+                f"stake=${stake:.2f}"
+            )
+
+            resp = await place_kalshi_order(
+                session,
+                config.kalshi_api_key,
+                bet.kalshi_ticker,
+                bet.kalshi_side,
+                count,
+                bet.kalshi_ask_cents,
+            )
+
+            entry = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "ticker": bet.kalshi_ticker,
+                "side": bet.kalshi_side,
+                "count": count,
+                "limit_cents": bet.kalshi_ask_cents,
+                "ev_pct": bet.ev_pct,
+                "kelly_pct": round(kelly_quarter * 100, 2),
+                "stake_usd": round(stake, 2),
+                "event": bet.event_name,
+                "http_status": resp.get("http_status"),
+                "success": resp.get("http_status") == 201,
+                "error": resp.get("error"),
+            }
+            trade_log.insert(0, entry)
+            if len(trade_log) > 50:
+                trade_log.pop()
+
+            if resp.get("http_status") == 201:
+                placed_orders.add((bet.kalshi_ticker, bet.kalshi_side))
+                print(f"[auto-trade] ✓ order placed for {bet.kalshi_ticker}")
+            else:
+                print(f"[auto-trade] ✗ failed: {resp}")
 
 # ---------------------------------------------------------------------------
 # Background scan loop
@@ -66,6 +151,7 @@ async def background_loop():
                     min_edge=config.min_edge,
                 )
                 await broadcast(result)
+                await auto_trade_kalshi(result)
             except Exception as e:
                 print(f"[server] scan error: {e}")
         await asyncio.sleep(config.interval_seconds)
@@ -87,7 +173,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 async def status():
     if last_result is None:
         return {"status": "no_scan_yet", "message": "Configure keys and trigger /scan"}
-    return JSONResponse(content=json.loads(last_result.to_json()))
+    data = json.loads(last_result.to_json())
+    data["auto_trade_enabled"] = config.auto_trade
+    data["recent_trades"] = trade_log[:5]
+    return JSONResponse(content=data)
 
 @app.get("/scan")
 async def trigger_scan():
@@ -100,22 +189,28 @@ async def trigger_scan():
         min_edge=config.min_edge,
     )
     await broadcast(result)
+    await auto_trade_kalshi(result)
     return JSONResponse(content=json.loads(result.to_json()))
 
 @app.post("/config")
 async def update_config(new_cfg: Config):
     global config
-    # Preserve hardcoded API keys — not sent by the UI
     new_cfg.odds_api_key   = config.odds_api_key
     new_cfg.kalshi_api_key = config.kalshi_api_key
     config = new_cfg
-    return {"status": "updated", "config": config.model_dump(exclude={"odds_api_key", "kalshi_api_key"})}
+    return {
+        "status": "updated",
+        "config": config.model_dump(exclude={"odds_api_key", "kalshi_api_key"}),
+    }
+
+@app.get("/trade-log")
+async def get_trade_log():
+    return {"trades": trade_log, "auto_trade_enabled": config.auto_trade}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     ws_clients.append(websocket)
-    # Send latest result immediately on connect
     if last_result:
         await websocket.send_text(last_result.to_json())
     try:

@@ -175,7 +175,14 @@
           <label>Scan interval (seconds)</label>
           <input type="number" id="interval" value="60" min="15">
         </div>
-        <button class="btn btn-outline" onclick="pushConfig()">Apply interval</button>
+        <div class="field" style="margin-top:10px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="autoTrade" onchange="pushConfig()">
+            <span>Auto-trade Kalshi (+EV ≥ <input type="number" id="evThreshold" value="5" min="1" max="50" step="0.5" style="width:48px;display:inline-block" onchange="pushConfig()">% EV, 25% Kelly)</span>
+          </label>
+          <div id="tradeLogWrap" style="display:none;margin-top:8px;max-height:120px;overflow-y:auto;font-size:11px;color:var(--muted)"></div>
+        </div>
+        <button class="btn btn-outline" onclick="pushConfig()">Apply settings</button>
       </div>
 
       <hr class="divider">
@@ -356,18 +363,42 @@ async function triggerScan() {
 
 async function pushConfig() {
   const base = document.getElementById('serverUrl').value.replace(/\/$/, '');
+  const autoTrade = document.getElementById('autoTrade').checked;
   const cfg = {
     interval_seconds: parseInt(document.getElementById('interval').value) || 60,
+    bankroll: parseFloat(document.getElementById('stake').value) || 1000,
+    ev_threshold: parseFloat(document.getElementById('evThreshold').value) || 5.0,
     min_edge: 0,
-    arbs_only: false
+    arbs_only: false,
+    auto_trade: autoTrade,
   };
+  document.getElementById('tradeLogWrap').style.display = autoTrade ? 'block' : 'none';
   try {
     const res = await fetch(base + '/config', {
       method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg)
     });
-    if (res.ok) { log('Interval updated. Triggering scan...', 'ok'); triggerScan(); }
+    if (res.ok) { log('Settings updated. Triggering scan...', 'ok'); triggerScan(); }
     else { log('Config error: ' + res.status, 'err'); }
   } catch(e) { log('Config failed: ' + e.message, 'err'); }
+}
+
+async function refreshTradeLog() {
+  const base = document.getElementById('serverUrl').value.replace(/\/$/, '');
+  try {
+    const res = await fetch(base + '/trade-log');
+    if (!res.ok) return;
+    const data = await res.json();
+    const wrap = document.getElementById('tradeLogWrap');
+    if (!data.trades || !data.trades.length) {
+      wrap.innerHTML = '<em>No auto-trades placed yet.</em>';
+      return;
+    }
+    wrap.innerHTML = data.trades.map(t => {
+      const icon = t.success ? '✓' : '✗';
+      const time = new Date(t.ts).toLocaleTimeString();
+      return `<div style="padding:2px 0;border-bottom:1px solid rgba(255,255,255,.05)">${icon} ${time} — ${t.side.toUpperCase()} ${t.count}× <strong>${t.ticker}</strong> @ ${t.limit_cents}¢  EV=${t.ev_pct.toFixed(1)}%  $${t.stake_usd}${t.error ? ' <span style="color:var(--red)">'+t.error+'</span>' : ''}</div>`;
+    }).join('');
+  } catch(e) {}
 }
 
 function ingestResult(data) {
@@ -389,6 +420,7 @@ function ingestResult(data) {
   }
   log(`Scan received: ${data.total_scanned} markets, ${data.arb_count} arbs`);
   render();
+  if (document.getElementById('autoTrade').checked) refreshTradeLog();
 
   // Countdown to next scan
   const interval = parseInt(document.getElementById('interval').value) || 60;
@@ -766,6 +798,7 @@ function renderEV() {
         <span class="opp-name">${b.event_name} · ${b.leg.outcome}${b._boosted ? ' <span style="font-size:10px;color:var(--amber)">⚡</span>' : ''}</span>
         <span class="sport-tag">${sport}</span>
         <span class="source-tag sportsbook">+EV</span>
+        ${b.kalshi_ticker && document.getElementById('autoTrade').checked ? '<span style="font-size:10px;background:rgba(99,102,241,.2);color:#818cf8;border-radius:4px;padding:2px 6px;margin-left:4px">⚡ auto-trade</span>' : ''}
         <span class="ev-chip">~+$${evDollars}/bet</span>
         <span class="chevron" id="evc${i}">›</span>
       </div>

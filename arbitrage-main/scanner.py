@@ -7,7 +7,9 @@ detects arbitrage opportunities, and ranks them by edge.
 import asyncio
 import aiohttp
 import json
+import re
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 from datetime import datetime, timezone
@@ -101,7 +103,8 @@ BETTABLE_BOOKS = [
 ]
 
 # Sharp-line reference books — used ONLY for +EV de-vig, never as arb legs.
-SHARP_BOOKS = ["pinnacle", "lowvig"]
+# Averaging across multiple sharp books reduces noise in fair-line estimation.
+SHARP_BOOKS = ["pinnacle", "bookmaker", "circa_sports"]
 
 # All bookmakers sent to The Odds API (bettable + sharp for EV reference).
 BOOKMAKERS = BETTABLE_BOOKS + SHARP_BOOKS
@@ -258,7 +261,10 @@ class PlusEVBet:
     sharp_prob: float       # de-vigged true probability from sharp book
     ev_pct: float           # (fair_prob * decimal_odds - 1) * 100
     sharp_book: str
-    sharp_raw_prob: float = 0.0  # raw Pinnacle/Lowvig implied prob before de-vig
+    sharp_raw_prob: float = 0.0   # raw implied prob before de-vig
+    kalshi_ticker: str = ""       # Kalshi market ticker; set for Kalshi auto-trade bets
+    kalshi_side: str = ""         # "yes" or "no"
+    kalshi_ask_cents: int = 0     # current ask price in cents for limit order
 
     def to_dict(self) -> dict:
         return {
@@ -270,14 +276,59 @@ class PlusEVBet:
             "sharp_raw_prob": self.sharp_raw_prob,
             "ev_pct": self.ev_pct,
             "sharp_book": self.sharp_book,
+            "kalshi_ticker": self.kalshi_ticker,
+            "kalshi_side": self.kalshi_side,
+            "kalshi_ask_cents": self.kalshi_ask_cents,
             "source": "ev",
         }
 
 
+def _avg_sharp_fair(bookmakers: list[dict]) -> tuple[dict[str, float], dict[str, float], str]:
+    """
+    Collect all sharp books present for an event and return averaged
+    de-vigged fair probabilities, raw implied probs, and a label string.
+    Returns (fair_dict, raw_dict, sharp_label). Empty dicts if no sharp data.
+    """
+    all_fair: dict[str, list[float]] = {}
+    all_raw:  dict[str, list[float]] = {}
+    titles_seen: list[str] = []
+
+    for sharp_key in SHARP_BOOKS:
+        for bm in bookmakers:
+            if bm.get("key") != sharp_key:
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt["key"] != "h2h" or len(mkt.get("outcomes", [])) < 2:
+                    continue
+                raw_pairs = [
+                    (out["name"], implied_prob(out["price"]))
+                    for out in mkt["outcomes"]
+                    if out.get("price", 0) > 1.0
+                ]
+                if len(raw_pairs) < 2:
+                    continue
+                names, probs = zip(*raw_pairs)
+                fair_list = _devig_probs(list(probs))
+                for n, r, f in zip(names, probs, fair_list):
+                    all_raw.setdefault(n, []).append(r)
+                    all_fair.setdefault(n, []).append(f)
+                titles_seen.append(bm["title"])
+                break  # one h2h market per book is enough
+
+    if not all_fair:
+        return {}, {}, ""
+
+    fair = {n: sum(ps) / len(ps) for n, ps in all_fair.items()}
+    raw  = {n: sum(ps) / len(ps) for n, ps in all_raw.items()}
+    label = " / ".join(dict.fromkeys(titles_seen))  # deduplicated, ordered
+    return fair, raw, label
+
+
 def find_plus_ev_bets(events: list[dict]) -> list[PlusEVBet]:
     """
-    Use the sharpest available book's h2h line as a no-vig reference.
-    Any soft-book outcome priced better than the fair probability is +EV.
+    Average de-vigged lines from all available sharp books (Pinnacle, Bookmaker,
+    Circa) to build a fair-probability reference. Any soft-book h2h price that
+    beats the averaged fair line is flagged as +EV.
     """
     results = []
     for ev in events:
@@ -286,41 +337,12 @@ def find_plus_ev_bets(events: list[dict]) -> list[PlusEVBet]:
         commence_time = ev.get("commence_time", "")
         bookmakers = ev.get("bookmakers", [])
 
-        # Find the sharpest book that has an h2h market for this event
-        sharp_h2h: Optional[dict] = None
-        sharp_title = ""
-        for sharp_key in SHARP_BOOKS:
-            for bm in bookmakers:
-                if bm.get("key") != sharp_key:
-                    continue
-                for mkt in bm.get("markets", []):
-                    if mkt["key"] == "h2h" and len(mkt.get("outcomes", [])) >= 2:
-                        sharp_h2h = mkt
-                        sharp_title = bm["title"]
-                        break
-                if sharp_h2h:
-                    break
-            if sharp_h2h:
-                break
-
-        if not sharp_h2h:
+        fair, raw_dict, sharp_title = _avg_sharp_fair(bookmakers)
+        if not fair:
             continue
 
-        # De-vig the sharp line to get fair probabilities
-        sharp_raw = [
-            (out["name"], implied_prob(out["price"]))
-            for out in sharp_h2h["outcomes"]
-            if out.get("price", 0) > 1.0
-        ]
-        if len(sharp_raw) < 2:
-            continue
-        names, probs = zip(*sharp_raw)
-        raw_dict = dict(zip(names, probs))          # raw implied probs before de-vig
-        fair = dict(zip(names, _devig_probs(list(probs))))
-
-        # Check every soft book for +EV pricing vs the fair line
         for bm in bookmakers:
-            if bm.get("key") in SHARP_BOOKS:
+            if bm.get("key") in set(SHARP_BOOKS):
                 continue
             for mkt in bm.get("markets", []):
                 if mkt["key"] != "h2h":
@@ -513,14 +535,14 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
 KALSHI_FEE_COEF = 0.07  # taker fee: $0.07 × C × (1−C) per $1 contract, where C = price in dollars
 
-async def fetch_kalshi_markets(session: aiohttp.ClientSession, api_key: str) -> list[ArbOpportunity]:
+async def fetch_kalshi_raw(session: aiohttp.ClientSession, api_key: str) -> list[dict]:
     """
-    Fetch active binary markets from Kalshi using an API key.
-    Paginates via cursor until all open markets are retrieved.
+    Fetch all open Kalshi markets, paginating via cursor.
+    Returns raw market dicts filtered to sports-like markets.
     """
     headers = {"Authorization": api_key, "Content-Type": "application/json"}
     markets: list[dict] = []
-    cursor: str | None = None
+    cursor: Optional[str] = None
 
     while True:
         url = f"{KALSHI_BASE}/markets?limit=1000&status=open"
@@ -545,7 +567,13 @@ async def fetch_kalshi_markets(session: aiohttp.ClientSession, api_key: str) -> 
 
     sports_markets = [m for m in markets if _looks_like_sports_market(m)]
     print(f"  [kalshi] {len(markets)} open markets ({len(sports_markets)} sports-like)")
-    return parse_kalshi_markets(sports_markets)
+    return sports_markets
+
+
+async def fetch_kalshi_markets(session: aiohttp.ClientSession, api_key: str) -> list[ArbOpportunity]:
+    """Convenience wrapper: fetch + parse into ArbOpportunity list."""
+    raw = await fetch_kalshi_raw(session, api_key)
+    return parse_kalshi_markets(raw)
 
 
 def _looks_like_sports_market(market: dict) -> bool:
@@ -613,6 +641,198 @@ def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
             source="kalshi",
         ))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Kalshi +EV detection (cross-referenced against sharp sportsbook lines)
+# ---------------------------------------------------------------------------
+
+_STOP_WORDS = {"the", "a", "an", "vs", "at", "in", "of", "to", "for",
+               "will", "win", "game", "who", "which", "team", "over",
+               "under", "next", "be", "on", "by", "is", "are"}
+
+def _title_tokens(text: str) -> set[str]:
+    return set(re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()) - _STOP_WORDS
+
+
+def find_kalshi_ev_bets(
+    kalshi_raw: list[dict],
+    sportsbook_events: list[dict],
+) -> list[PlusEVBet]:
+    """
+    Cross-reference Kalshi markets against sharp sportsbook lines to find +EV
+    contracts. Only considers pre-game markets (game not yet started).
+    YES/NO is mapped to a team by overlapping token matching on the market title.
+    """
+    now = datetime.now(timezone.utc)
+    results: list[PlusEVBet] = []
+
+    # Pre-compute sharp fair probs for every sportsbook event.
+    # Store alongside the home/away tokens for fast matching.
+    sharp_refs: list[dict] = []
+    for ev in sportsbook_events:
+        home = ev.get("home_team", "")
+        away = ev.get("away_team", "")
+        commence_time = ev.get("commence_time", "")
+        bookmakers = ev.get("bookmakers", [])
+
+        fair, _, sharp_title = _avg_sharp_fair(bookmakers)
+        if not fair:
+            continue
+
+        sharp_refs.append({
+            "home": home,
+            "away": away,
+            "tokens": _title_tokens(f"{home} {away}"),
+            "fair": fair,           # {outcome_name: fair_prob}
+            "sharp_title": sharp_title,
+            "commence_time": commence_time,
+        })
+
+    for km in kalshi_raw:
+        ticker = km.get("ticker", "")
+        yes_ask = km.get("yes_ask")
+        no_ask  = km.get("no_ask")
+        if not ticker or yes_ask is None or no_ask is None:
+            continue
+        if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
+            continue
+
+        km_tokens = _title_tokens(km.get("title", ""))
+        if not km_tokens:
+            continue
+
+        # Find best-matching sportsbook event by token overlap.
+        best_ref = None
+        best_overlap = 1  # require at least 2 overlapping tokens
+        for ref in sharp_refs:
+            overlap = len(km_tokens & ref["tokens"])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_ref = ref
+
+        if best_ref is None:
+            continue
+
+        # Skip live bets (game already started).
+        try:
+            ct = datetime.fromisoformat(best_ref["commence_time"].replace("Z", "+00:00"))
+            if ct <= now:
+                continue
+        except Exception:
+            continue  # can't verify pre-game — skip to be safe
+
+        fair = best_ref["fair"]
+        sharp_title = best_ref["sharp_title"]
+        commence_time = best_ref["commence_time"]
+        km_title = km.get("title", ticker)
+
+        # Map YES to whichever sportsbook outcome name has the most token overlap
+        # with the Kalshi market title (e.g. "Will the Lakers win?" → Lakers).
+        yes_team: Optional[str] = None
+        yes_fair: float = 0.0
+        best_team_overlap = 0
+        for outcome_name in fair:
+            team_tokens = _title_tokens(outcome_name)
+            ov = len(km_tokens & team_tokens)
+            if ov > best_team_overlap:
+                best_team_overlap = ov
+                yes_team = outcome_name
+                yes_fair = fair[outcome_name]
+
+        if yes_team is None or best_team_overlap == 0:
+            continue
+
+        no_fair = 1.0 - yes_fair  # binary market
+
+        # Effective decimal odds including Kalshi fee
+        c_yes = yes_ask / 100
+        c_no  = no_ask  / 100
+        yes_dec = (1 - KALSHI_FEE_COEF * c_yes * (1 - c_yes)) / c_yes
+        no_dec  = (1 - KALSHI_FEE_COEF * c_no  * (1 - c_no )) / c_no
+
+        yes_ev = yes_fair * yes_dec - 1
+        no_ev  = no_fair  * no_dec  - 1
+
+        if yes_ev > 0:
+            results.append(PlusEVBet(
+                event_name=km_title,
+                sport="prediction_market",
+                commence_time=commence_time,
+                leg=Leg(
+                    book="Kalshi",
+                    outcome=f"YES — {yes_team}",
+                    decimal_odds=round(yes_dec, 4),
+                    american_odds=decimal_to_american(yes_dec),
+                    implied_prob=implied_prob(yes_dec),
+                    market_url=f"https://kalshi.com/markets/{ticker}",
+                ),
+                sharp_prob=round(yes_fair, 4),
+                ev_pct=round(yes_ev * 100, 4),
+                sharp_book=sharp_title,
+                kalshi_ticker=ticker,
+                kalshi_side="yes",
+                kalshi_ask_cents=yes_ask,
+            ))
+
+        if no_ev > 0:
+            no_team = next((n for n in fair if n != yes_team), "NO")
+            results.append(PlusEVBet(
+                event_name=km_title,
+                sport="prediction_market",
+                commence_time=commence_time,
+                leg=Leg(
+                    book="Kalshi",
+                    outcome=f"NO — {no_team}",
+                    decimal_odds=round(no_dec, 4),
+                    american_odds=decimal_to_american(no_dec),
+                    implied_prob=implied_prob(no_dec),
+                    market_url=f"https://kalshi.com/markets/{ticker}",
+                ),
+                sharp_prob=round(no_fair, 4),
+                ev_pct=round(no_ev * 100, 4),
+                sharp_book=sharp_title,
+                kalshi_ticker=ticker,
+                kalshi_side="no",
+                kalshi_ask_cents=no_ask,
+            ))
+
+    return results
+
+
+async def place_kalshi_order(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    ticker: str,
+    side: str,          # "yes" or "no"
+    count: int,         # number of contracts
+    limit_cents: int,   # limit price in cents (max you'll pay per contract)
+) -> dict:
+    """Place a limit buy order on Kalshi. Returns {"status": http_code, ...}."""
+    headers = {"Authorization": api_key, "Content-Type": "application/json"}
+    client_id = f"autobet-{ticker[:20]}-{side}-{uuid.uuid4().hex[:8]}"
+    # yes_price + no_price should approximately sum to 100 for a limit order.
+    yes_price = limit_cents if side == "yes" else (100 - limit_cents)
+    no_price  = limit_cents if side == "no"  else (100 - limit_cents)
+    body = {
+        "ticker": ticker,
+        "client_order_id": client_id,
+        "type": "limit",
+        "action": "buy",
+        "side": side,
+        "count": count,
+        "yes_price": yes_price,
+        "no_price": no_price,
+        "expiration_ts": None,
+    }
+    url = f"{KALSHI_BASE}/portfolio/orders"
+    try:
+        async with session.post(url, headers=headers, json=body,
+                                timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            data = await resp.json()
+            return {"http_status": resp.status, "order": data}
+    except Exception as e:
+        return {"http_status": 0, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -717,33 +937,44 @@ async def scan(
             for sport in sports:
                 tasks.append(fetch_sport_odds(session, odds_api_key, sport))
 
-        kalshi_task = None
+        kalshi_raw_task = None
         if kalshi_api_key:
-            kalshi_task = fetch_kalshi_markets(session, kalshi_api_key)
+            kalshi_raw_task = fetch_kalshi_raw(session, kalshi_api_key)
 
-        print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_task else '0 Kalshi'} requests...")
+        print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_raw_task else '0 Kalshi'} requests...")
         t0 = time.time()
 
         sb_results_raw = await asyncio.gather(*tasks, return_exceptions=True)
-        kalshi_opps: list[ArbOpportunity] = []
-        if kalshi_task:
+        kalshi_raw_markets: list[dict] = []
+        if kalshi_raw_task:
             try:
-                kalshi_opps = await kalshi_task
+                kalshi_raw_markets = await kalshi_raw_task
             except Exception as e:
                 errors.append(f"Kalshi: {e}")
 
+        kalshi_opps = parse_kalshi_markets(kalshi_raw_markets)
+
         sb_opps: list[ArbOpportunity] = []
         ev_bets: list[PlusEVBet] = []
+        all_raw_events: list[dict] = []   # kept for Kalshi EV cross-reference
         for res in sb_results_raw:
             if isinstance(res, Exception):
                 errors.append(str(res))
             elif res:
+                all_raw_events.extend(res)
                 parsed = parse_sportsbook_events(res)
                 sb_opps.extend(parsed)
                 for opp in parsed:
                     for leg in opp.legs:
                         books_seen.add(leg.book)
                 ev_bets.extend(find_plus_ev_bets(res))
+
+        # Kalshi +EV bets (cross-referenced against sharp sportsbook lines)
+        if kalshi_raw_markets and all_raw_events:
+            kalshi_ev = find_kalshi_ev_bets(kalshi_raw_markets, all_raw_events)
+            ev_bets.extend(kalshi_ev)
+            if kalshi_ev:
+                print(f"  [kalshi-ev] {len(kalshi_ev)} +EV Kalshi bets found")
 
         all_opps = sb_opps + kalshi_opps
 
