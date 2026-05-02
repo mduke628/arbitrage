@@ -713,7 +713,8 @@ async def fetch_kalshi_raw(session: aiohttp.ClientSession, api_key: str) -> list
         if not cursor:
             break
 
-    sports_markets = [m for m in markets if _looks_like_sports_market(m)]
+    normalized = [_normalize_kalshi_market(m) for m in markets]
+    sports_markets = [m for m in normalized if _looks_like_sports_market(m)]
     print(f"  [kalshi] {len(markets)} open markets ({len(sports_markets)} sports-like)")
     return sports_markets
 
@@ -744,6 +745,41 @@ def _looks_like_sports_market(market: dict) -> bool:
         "rangers", "knicks", "mets", "yankees", "giants", "jets", "devils", "islanders",
     }
     return any(token in text for token in sports_tokens)
+
+
+def _normalize_kalshi_market(m: dict) -> dict:
+    """
+    Kalshi's API now returns prices as dollar floats (yes_ask_dollars, etc.).
+    Convert them to integer cents and populate the legacy yes_ask/no_ask keys
+    that the rest of the scanner expects.  Prices of 0¢ or 100¢ mean no active
+    order on that side; treat them as absent.
+    """
+    def _to_cents(val) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            c = round(float(val) * 100)
+            return c if 1 <= c <= 99 else None
+        except (ValueError, TypeError):
+            return None
+
+    yes_ask = _to_cents(m.get("yes_ask_dollars") or m.get("yes_ask"))
+    yes_bid = _to_cents(m.get("yes_bid_dollars") or m.get("yes_bid"))
+    no_ask  = _to_cents(m.get("no_ask_dollars")  or m.get("no_ask"))
+    no_bid  = _to_cents(m.get("no_bid_dollars")  or m.get("no_bid"))
+
+    # Derive missing sides from the complement (YES + NO = 100¢)
+    if yes_ask is None and no_bid is not None:
+        yes_ask = 100 - no_bid if 1 <= 100 - no_bid <= 99 else None
+    if no_ask is None and yes_bid is not None:
+        no_ask = 100 - yes_bid if 1 <= 100 - yes_bid <= 99 else None
+
+    result = dict(m)
+    result["yes_ask"] = yes_ask
+    result["yes_bid"] = yes_bid
+    result["no_ask"]  = no_ask
+    result["no_bid"]  = no_bid
+    return result
 
 
 def parse_kalshi_markets(markets: list[dict]) -> list[ArbOpportunity]:
