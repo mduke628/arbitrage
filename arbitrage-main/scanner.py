@@ -609,11 +609,18 @@ def _kalshi_bearer_headers(api_key: str) -> dict:
 
 
 def _kalshi_rsa_headers(method: str, path: str, api_key: str) -> dict:
-    """Build RSA-signed Kalshi headers. Caller must check _PRIVATE_KEY_BYTES/_CRYPTO_OK first."""
+    """Build RSA-signed Kalshi headers. Kalshi requires RSA-PSS with SHA256."""
     ts_ms = str(int(time.time() * 1000))
-    msg = ts_ms + method.upper() + path
+    msg = (ts_ms + method.upper() + path).encode("utf-8")
     pk = serialization.load_pem_private_key(_PRIVATE_KEY_BYTES, password=None)
-    sig = pk.sign(msg.encode(), _asym_padding.PKCS1v15(), hashes.SHA256())
+    sig = pk.sign(
+        msg,
+        _asym_padding.PSS(
+            mgf=_asym_padding.MGF1(hashes.SHA256()),
+            salt_length=_asym_padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
     return {
         "KALSHI-ACCESS-KEY": api_key,
         "KALSHI-ACCESS-TIMESTAMP": ts_ms,
