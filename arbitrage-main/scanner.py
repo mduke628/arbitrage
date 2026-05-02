@@ -29,9 +29,14 @@ _PRIVATE_KEY_BYTES: Optional[bytes] = None
 _pem_path = Path(__file__).parent / "private_key.pem"
 if _pem_path.exists():
     _PRIVATE_KEY_BYTES = _pem_path.read_bytes()
-    print("[kalshi] RSA private key loaded — using KALSHI-ACCESS-SIGNATURE auth")
+    print("[kalshi] RSA private key loaded — will try KALSHI-ACCESS-SIGNATURE auth first, "
+          "bearer token fallback on 401")
 else:
-    print("[kalshi] No private_key.pem found — falling back to bearer token auth")
+    print("[kalshi] No private_key.pem found — using bearer token auth")
+
+# Tracks whether RSA auth succeeded this session.
+# None = not yet tried, True = working, False = failed → use bearer.
+_kalshi_rsa_ok: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -599,26 +604,68 @@ KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
 KALSHI_FEE_COEF = 0.07  # taker fee: $0.07 × C × (1−C) per $1 contract, where C = price in dollars
 
 
+def _kalshi_bearer_headers(api_key: str) -> dict:
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+
+def _kalshi_rsa_headers(method: str, path: str, api_key: str) -> dict:
+    """Build RSA-signed Kalshi headers. Caller must check _PRIVATE_KEY_BYTES/_CRYPTO_OK first."""
+    ts_ms = str(int(time.time() * 1000))
+    msg = ts_ms + method.upper() + path
+    pk = serialization.load_pem_private_key(_PRIVATE_KEY_BYTES, password=None)
+    sig = pk.sign(msg.encode(), _asym_padding.PKCS1v15(), hashes.SHA256())
+    return {
+        "KALSHI-ACCESS-KEY": api_key,
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+        "Content-Type": "application/json",
+    }
+
+
 def _kalshi_headers(method: str, path: str, api_key: str) -> dict:
     """
-    Return Kalshi authentication headers.
-    Prefers RSA-SHA256 (KALSHI-ACCESS-SIGNATURE) when private_key.pem is present;
-    falls back to simple bearer token otherwise.
-    The path argument should be just the URL path, no domain, no query string.
+    Return Kalshi auth headers.
+    Uses RSA-SHA256 when private_key.pem is present AND RSA hasn't been seen to fail;
+    falls back to Bearer token otherwise.
     """
-    if _PRIVATE_KEY_BYTES and _CRYPTO_OK:
-        ts_ms = str(int(time.time() * 1000))
-        msg = ts_ms + method.upper() + path
-        pk = serialization.load_pem_private_key(_PRIVATE_KEY_BYTES, password=None)
-        sig = pk.sign(msg.encode(), _asym_padding.PKCS1v15(), hashes.SHA256())
-        return {
-            "KALSHI-ACCESS-KEY": api_key,
-            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
-            "Content-Type": "application/json",
-        }
-    # Bearer token fallback
-    return {"Authorization": api_key, "Content-Type": "application/json"}
+    if _PRIVATE_KEY_BYTES and _CRYPTO_OK and _kalshi_rsa_ok is not False:
+        return _kalshi_rsa_headers(method, path, api_key)
+    return _kalshi_bearer_headers(api_key)
+
+
+async def _kalshi_get(
+    session: aiohttp.ClientSession, url: str, path: str, api_key: str
+) -> dict:
+    """
+    GET a Kalshi endpoint with automatic RSA → bearer fallback on 401.
+    Returns the parsed JSON dict.  Raises ValueError on persistent auth failure.
+    """
+    global _kalshi_rsa_ok
+
+    async def _try(hdrs: dict) -> tuple[int, dict]:
+        async with session.get(url, headers=hdrs, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            return r.status, (await r.json() if r.status == 200 else {})
+
+    headers = _kalshi_headers("GET", path, api_key)
+    status, data = await _try(headers)
+
+    if status == 401 and _PRIVATE_KEY_BYTES and _CRYPTO_OK and _kalshi_rsa_ok is not False:
+        # RSA auth failed — the KALSHI_API_KEY is a bearer token, not an RSA key ID.
+        # Switch to bearer for the rest of this session.
+        _kalshi_rsa_ok = False
+        print("[kalshi] RSA auth returned 401 — switching to bearer token auth")
+        status, data = await _try(_kalshi_bearer_headers(api_key))
+
+    if status == 401:
+        raise ValueError("Kalshi API key invalid or unauthorized")
+    if status != 200:
+        print(f"  [kalshi] HTTP {status}")
+        return {}
+
+    if _kalshi_rsa_ok is None and _PRIVATE_KEY_BYTES and _CRYPTO_OK:
+        _kalshi_rsa_ok = True  # RSA confirmed working
+
+    return data
 
 
 async def fetch_kalshi_raw(session: aiohttp.ClientSession, api_key: str) -> list[dict]:
@@ -634,17 +681,12 @@ async def fetch_kalshi_raw(session: aiohttp.ClientSession, api_key: str) -> list
         url = f"{KALSHI_BASE}/markets?limit=1000&status=open"
         if cursor:
             url += f"&cursor={cursor}"
-        headers = _kalshi_headers("GET", path, api_key)
         try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status == 401:
-                    raise ValueError("Kalshi API key invalid or unauthorized")
-                if resp.status != 200:
-                    print(f"  [kalshi] HTTP {resp.status}")
-                    break
-                data = await resp.json()
+            data = await _kalshi_get(session, url, path, api_key)
         except Exception as e:
             print(f"  [kalshi] error: {e}")
+            break
+        if not data:
             break
 
         markets.extend(data.get("markets", []))
@@ -1092,11 +1134,9 @@ async def place_kalshi_order(
     count: int,         # number of contracts
     limit_cents: int,   # limit price in cents (max you'll pay per contract)
 ) -> dict:
-    """Place a limit buy order on Kalshi. Returns {"status": http_code, ...}."""
+    """Place a limit buy order on Kalshi. Returns {"http_status": code, ...}."""
     path = "/trade-api/v2/portfolio/orders"
-    headers = _kalshi_headers("POST", path, api_key)
     client_id = f"autobet-{ticker[:20]}-{side}-{uuid.uuid4().hex[:8]}"
-    # yes_price + no_price should approximately sum to 100 for a limit order.
     yes_price = limit_cents if side == "yes" else (100 - limit_cents)
     no_price  = limit_cents if side == "no"  else (100 - limit_cents)
     body = {
@@ -1111,11 +1151,18 @@ async def place_kalshi_order(
         "expiration_ts": None,
     }
     url = f"{KALSHI_BASE}/portfolio/orders"
-    try:
-        async with session.post(url, headers=headers, json=body,
+
+    async def _post(hdrs: dict) -> dict:
+        async with session.post(url, headers=hdrs, json=body,
                                 timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            data = await resp.json()
-            return {"http_status": resp.status, "order": data}
+            return {"http_status": resp.status, "order": await resp.json()}
+
+    try:
+        result = await _post(_kalshi_headers("POST", path, api_key))
+        if result["http_status"] == 401 and _PRIVATE_KEY_BYTES and _CRYPTO_OK and _kalshi_rsa_ok is not False:
+            print("[kalshi] RSA auth 401 on order — retrying with bearer token")
+            result = await _post(_kalshi_bearer_headers(api_key))
+        return result
     except Exception as e:
         return {"http_status": 0, "error": str(e)}
 
