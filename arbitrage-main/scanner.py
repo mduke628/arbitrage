@@ -29,13 +29,20 @@ _PRIVATE_KEY_BYTES: Optional[bytes] = None
 _pem_path = Path(__file__).parent / "private_key.pem"
 if _pem_path.exists():
     _PRIVATE_KEY_BYTES = _pem_path.read_bytes()
-    print("[kalshi] RSA private key loaded — will try KALSHI-ACCESS-SIGNATURE auth first, "
-          "bearer token fallback on 401")
-else:
-    print("[kalshi] No private_key.pem found — using bearer token auth")
 
-# Tracks whether RSA auth succeeded this session.
-# None = not yet tried, True = working, False = failed → use bearer.
+# Simple bearer token (KALSHI_API_TOKEN) takes priority over RSA when set.
+# If not set, falls back to RSA with private_key.pem + KALSHI_API_KEY as key ID.
+_KALSHI_BEARER_TOKEN: str = os.getenv("KALSHI_API_TOKEN", "")
+
+if _KALSHI_BEARER_TOKEN:
+    print("[kalshi] KALSHI_API_TOKEN found — using bearer token auth")
+elif _PRIVATE_KEY_BYTES:
+    print("[kalshi] RSA private key loaded — using KALSHI-ACCESS-SIGNATURE auth")
+else:
+    print("[kalshi] No KALSHI_API_TOKEN or private_key.pem — will attempt bearer with KALSHI_API_KEY")
+
+# Tracks whether RSA auth succeeded this session (only relevant if bearer token not set).
+# None = not yet tried, True = working, False = failed → fall back to KALSHI_API_KEY as bearer.
 _kalshi_rsa_ok: Optional[bool] = None
 
 
@@ -635,9 +642,10 @@ def _kalshi_rsa_headers(method: str, path: str, api_key: str) -> dict:
 def _kalshi_headers(method: str, path: str, api_key: str) -> dict:
     """
     Return Kalshi auth headers.
-    Uses RSA-SHA256 when private_key.pem is present AND RSA hasn't been seen to fail;
-    falls back to Bearer token otherwise.
+    Priority: KALSHI_API_TOKEN bearer > RSA (private_key.pem) > KALSHI_API_KEY bearer.
     """
+    if _KALSHI_BEARER_TOKEN:
+        return _kalshi_bearer_headers(_KALSHI_BEARER_TOKEN)
     if _PRIVATE_KEY_BYTES and _CRYPTO_OK and _kalshi_rsa_ok is not False:
         return _kalshi_rsa_headers(method, path, api_key)
     return _kalshi_bearer_headers(api_key)

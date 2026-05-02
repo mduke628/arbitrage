@@ -45,21 +45,23 @@ from scanner import scan, run_loop, ScanResult, SPORTS, place_kalshi_order
 class Config(BaseModel):
     # Use default_factory so os.getenv is called at instantiation time, not at class-definition
     # time. This guarantees load_dotenv has already run when the values are read.
-    odds_api_key:     str   = Field(default_factory=lambda: os.getenv("ODDS_API_KEY",   ""))
-    kalshi_api_key:   str   = Field(default_factory=lambda: os.getenv("KALSHI_API_KEY", ""))
-    interval_seconds: int   = Field(default_factory=lambda: int(os.getenv("SCAN_INTERVAL", "60")))
-    min_edge:         float = Field(default_factory=lambda: float(os.getenv("MIN_EDGE", "0.0")))
-    arbs_only:        bool  = False
-    sports:           list[str] = Field(default_factory=list)
-    bankroll:         float = Field(default_factory=lambda: float(os.getenv("BANKROLL", "1000.0")))
-    auto_trade:       bool  = Field(default_factory=lambda: os.getenv("AUTO_TRADE", "false").lower() == "true")
-    ev_threshold:     float = Field(default_factory=lambda: float(os.getenv("EV_THRESHOLD", "5.0")))
+    odds_api_key:      str   = Field(default_factory=lambda: os.getenv("ODDS_API_KEY",      ""))
+    kalshi_api_key:    str   = Field(default_factory=lambda: os.getenv("KALSHI_API_KEY",    ""))
+    kalshi_api_token:  str   = Field(default_factory=lambda: os.getenv("KALSHI_API_TOKEN",  ""))
+    interval_seconds:  int   = Field(default_factory=lambda: int(os.getenv("SCAN_INTERVAL", "60")))
+    min_edge:          float = Field(default_factory=lambda: float(os.getenv("MIN_EDGE", "0.0")))
+    arbs_only:         bool  = False
+    sports:            list[str] = Field(default_factory=list)
+    bankroll:          float = Field(default_factory=lambda: float(os.getenv("BANKROLL", "1000.0")))
+    auto_trade:        bool  = Field(default_factory=lambda: os.getenv("AUTO_TRADE", "false").lower() == "true")
+    ev_threshold:      float = Field(default_factory=lambda: float(os.getenv("EV_THRESHOLD", "5.0")))
 
 config = Config()
 
 # Print key-configuration status at startup so problems are obvious in the log.
-print(f"[server] ODDS_API_KEY   : {'SET (' + str(len(config.odds_api_key)) + ' chars)' if config.odds_api_key else 'NOT SET — add ODDS_API_KEY=... to your .env'}")
-print(f"[server] KALSHI_API_KEY : {'SET (' + str(len(config.kalshi_api_key)) + ' chars)' if config.kalshi_api_key else 'NOT SET — add KALSHI_API_KEY=... to your .env'}")
+print(f"[server] ODDS_API_KEY    : {'SET (' + str(len(config.odds_api_key)) + ' chars)' if config.odds_api_key else 'NOT SET — add ODDS_API_KEY=... to your .env'}")
+print(f"[server] KALSHI_API_KEY  : {'SET (' + str(len(config.kalshi_api_key)) + ' chars)' if config.kalshi_api_key else 'NOT SET — add KALSHI_API_KEY=... to your .env'}")
+print(f"[server] KALSHI_API_TOKEN: {'SET (' + str(len(config.kalshi_api_token)) + ' chars)' if config.kalshi_api_token else 'NOT SET (optional — add KALSHI_API_TOKEN=... to your .env for bearer auth)'}")
 last_result: ScanResult | None = None
 ws_clients: list[WebSocket] = []
 
