@@ -610,7 +610,7 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 # Kalshi API  (prediction markets)
 # ---------------------------------------------------------------------------
 
-KALSHI_BASE = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_FEE_COEF = 0.07  # taker fee: $0.07 × C × (1−C) per $1 contract, where C = price in dollars
 
 
@@ -627,7 +627,7 @@ def _kalshi_rsa_headers(method: str, path: str, api_key: str) -> dict:
         msg,
         _asym_padding.PSS(
             mgf=_asym_padding.MGF1(hashes.SHA256()),
-            salt_length=_asym_padding.PSS.MAX_LENGTH,
+            salt_length=_asym_padding.PSS.DIGEST_LENGTH,
         ),
         hashes.SHA256(),
     )
