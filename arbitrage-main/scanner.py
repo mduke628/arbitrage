@@ -329,6 +329,61 @@ def _avg_sharp_fair(bookmakers: list[dict]) -> tuple[dict[str, float], dict[str,
     return fair, raw, label
 
 
+def _avg_sharp_spreads(bookmakers: list[dict]) -> dict[tuple[str, float], float]:
+    """
+    Returns {(team_name, spread_point): avg_de-vigged_fair_prob}.
+    spread_point matches the value in the Odds API (negative for the favorite).
+    Key: ("Boston Celtics", -23.5) → probability that Boston covers -23.5.
+    """
+    all_data: dict[tuple[str, float], list[float]] = {}
+    for sharp_key in SHARP_BOOKS:
+        for bm in bookmakers:
+            if bm.get("key") != sharp_key:
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt["key"] != "spreads":
+                    continue
+                pairs = [
+                    (out["name"], out["point"], implied_prob(out["price"]))
+                    for out in mkt.get("outcomes", [])
+                    if out.get("price", 0) > 1.0 and out.get("point") is not None
+                ]
+                if len(pairs) < 2:
+                    continue
+                names, points, probs = zip(*pairs)
+                fair_list = _devig_probs(list(probs))
+                for n, p, f in zip(names, points, fair_list):
+                    all_data.setdefault((n, float(p)), []).append(f)
+    return {k: sum(vs) / len(vs) for k, vs in all_data.items()}
+
+
+def _avg_sharp_totals(bookmakers: list[dict]) -> dict[tuple[float, str], float]:
+    """
+    Returns {(point_value, "over"/"under"): avg_de-vigged_fair_prob}.
+    Key: (205.5, "over") → probability the total goes Over 205.5.
+    """
+    all_data: dict[tuple[float, str], list[float]] = {}
+    for sharp_key in SHARP_BOOKS:
+        for bm in bookmakers:
+            if bm.get("key") != sharp_key:
+                continue
+            for mkt in bm.get("markets", []):
+                if mkt["key"] != "totals":
+                    continue
+                pairs = [
+                    (out["name"].lower(), out["point"], implied_prob(out["price"]))
+                    for out in mkt.get("outcomes", [])
+                    if out.get("price", 0) > 1.0 and out.get("point") is not None
+                ]
+                if len(pairs) < 2:
+                    continue
+                names, points, probs = zip(*pairs)
+                fair_list = _devig_probs(list(probs))
+                for n, p, f in zip(names, points, fair_list):
+                    all_data.setdefault((float(p), n), []).append(f)
+    return {k: sum(vs) / len(vs) for k, vs in all_data.items()}
+
+
 def find_plus_ev_bets(events: list[dict]) -> list[PlusEVBet]:
     """
     Average de-vigged lines from all available sharp books (Pinnacle, Bookmaker,
@@ -401,12 +456,12 @@ async def fetch_all_active_sports(session: aiohttp.ClientSession, api_key: str) 
 
 
 async def fetch_sport_odds(session: aiohttp.ClientSession, api_key: str, sport: str) -> list[dict]:
-    # Only request the three sharp reference books — massive API quota saving
-    # vs. fetching 15+ bettable books we no longer need.
+    # Request all three market types — needed to match Kalshi spreads and totals
+    # against the sharp reference line at the same point value.
     books = ",".join(SHARP_BOOKS)
     url = (
         f"{ODDS_API_BASE}/sports/{sport}/odds/"
-        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets=h2h"
+        f"?apiKey={api_key}&regions=us,us2,uk,eu&markets=h2h,spreads,totals"
         f"&oddsFormat=decimal&bookmakers={books}"
     )
     try:
@@ -739,20 +794,76 @@ def _map_yes_to_team(km_title: str, km_tokens: set[str], fair: dict) -> tuple[Op
     return (best_team, best_fair) if best_score > 0 else (None, 0.0)
 
 
+# ---------------------------------------------------------------------------
+# Kalshi market type parser
+# ---------------------------------------------------------------------------
+
+_SPREAD_PATTERNS = [
+    # "Boston wins by over 23.5 points"
+    re.compile(r'^(.+?)\s+wins?\s+by\s+(?:over|more\s+than)\s+([\d.]+)\s+points?', re.I),
+    # "Boston to win by 23.5+ points"
+    re.compile(r'^(.+?)\s+(?:to\s+)?win\s+by\s+([\d.]+)\+?\s+points?', re.I),
+    # "Boston by 23.5 or more"
+    re.compile(r'^(.+?)\s+by\s+([\d.]+)\s+or\s+more', re.I),
+]
+_TOTAL_PATTERNS = [
+    # "Over/Under 205.5 points scored"
+    re.compile(r'^(over|under)\s+([\d.]+)\s+points?', re.I),
+    # "More than 205.5 total points"
+    re.compile(r'^more\s+than\s+([\d.]+)\s+(?:total\s+)?points?', re.I),
+]
+_TEAM_TOTAL_PATTERNS = [
+    # "Boston over/under 95.5 points scored"
+    re.compile(r'^(.+?)\s+(over|under)\s+([\d.]+)\s+points?', re.I),
+]
+
+
+def _parse_kalshi_mkt(title: str) -> Optional[dict]:
+    """
+    Return market-type metadata for a Kalshi market title, or None for moneyline/unknown.
+    Result keys:
+      spread:     {"type":"spread",  "team":str_lower,  "point":float}
+      total:      {"type":"total",   "side":"over"/"under", "point":float}
+      team_total: {"type":"team_total", "team":str_lower, "side":"over"/"under", "point":float}
+    """
+    for pat in _SPREAD_PATTERNS:
+        m = pat.match(title)
+        if m:
+            return {"type": "spread", "team": m.group(1).strip().lower(), "point": float(m.group(2))}
+
+    for pat in _TOTAL_PATTERNS:
+        m = pat.match(title)
+        if m:
+            if pat.pattern.startswith(r'^(over|under)'):
+                return {"type": "total", "side": m.group(1).lower(), "point": float(m.group(2))}
+            else:  # "more than X"
+                return {"type": "total", "side": "over", "point": float(m.group(1))}
+
+    for pat in _TEAM_TOTAL_PATTERNS:
+        m = pat.match(title)
+        if m:
+            return {"type": "team_total", "team": m.group(1).strip().lower(),
+                    "side": m.group(2).lower(), "point": float(m.group(3))}
+
+    return None  # moneyline or unrecognized
+
+
 def find_kalshi_ev_bets(
     kalshi_raw: list[dict],
     sportsbook_events: list[dict],
 ) -> list[PlusEVBet]:
     """
-    Cross-reference Kalshi markets against sharp sportsbook lines to find +EV
-    contracts. Only considers pre-game markets (game not yet started).
-    Matching uses full-name substring search + last-word + token overlap,
-    so short Kalshi titles like "Will the Lakers win?" still match correctly.
+    Cross-reference Kalshi markets (moneyline, spread, total) against sharp
+    sportsbook lines to find +EV contracts. Only pre-game markets are considered.
+
+    For spreads and totals the Kalshi point value must match the sharp book's
+    line exactly, since we can't interpolate across different lines. Moneyline
+    markets are matched by team-name string search.
     """
     now = datetime.now(timezone.utc)
     results: list[PlusEVBet] = []
 
-    # Pre-compute sharp fair probs for every sportsbook event.
+    # Build a sharp reference per sportsbook event containing all three market types.
     sharp_refs: list[dict] = []
     for ev in sportsbook_events:
         home = ev.get("home_team", "")
@@ -760,19 +871,54 @@ def find_kalshi_ev_bets(
         commence_time = ev.get("commence_time", "")
         bookmakers = ev.get("bookmakers", [])
 
-        fair, _, sharp_title = _avg_sharp_fair(bookmakers)
-        if not fair:
+        fair_h2h, _, sharp_title = _avg_sharp_fair(bookmakers)
+        # Spreads and totals are independent — compute even if h2h is unavailable.
+        fair_spreads = _avg_sharp_spreads(bookmakers)
+        fair_totals  = _avg_sharp_totals(bookmakers)
+
+        if not fair_h2h and not fair_spreads and not fair_totals:
             continue
 
         sharp_refs.append({
             "home": home,
             "away": away,
-            "fair": fair,
-            "sharp_title": sharp_title,
+            "fair_h2h":    fair_h2h,     # {team_name: prob}
+            "fair_spreads": fair_spreads, # {(team_name, point): prob}
+            "fair_totals":  fair_totals,  # {(point, "over"/"under"): prob}
+            "sharp_title":  sharp_title or "Sharp",
             "commence_time": commence_time,
         })
 
-    matched = 0
+    matched = unmatched = 0
+
+    def _make_ev_bet(km, ticker, side, ask_cents, fair_p, outcome_label,
+                     sharp_title, commence_time) -> Optional[PlusEVBet]:
+        c = ask_cents / 100
+        dec = (1 - KALSHI_FEE_COEF * c * (1 - c)) / c
+        ev = fair_p * dec - 1
+        if ev <= 0:
+            return None
+        km_title = km.get("title", ticker)
+        return PlusEVBet(
+            event_name=km_title,
+            sport="prediction_market",
+            commence_time=commence_time,
+            leg=Leg(
+                book="Kalshi",
+                outcome=outcome_label,
+                decimal_odds=round(dec, 4),
+                american_odds=decimal_to_american(dec),
+                implied_prob=implied_prob(dec),
+                market_url=f"https://kalshi.com/markets/{ticker}",
+            ),
+            sharp_prob=round(fair_p, 4),
+            ev_pct=round(ev * 100, 4),
+            sharp_book=sharp_title,
+            kalshi_ticker=ticker,
+            kalshi_side=side,
+            kalshi_ask_cents=ask_cents,
+        )
+
     for km in kalshi_raw:
         ticker = km.get("ticker", "")
         yes_ask = km.get("yes_ask")
@@ -782,10 +928,10 @@ def find_kalshi_ev_bets(
         if yes_ask <= 0 or no_ask <= 0 or yes_ask >= 100 or no_ask >= 100:
             continue
 
-        km_title = km.get("title", ticker)
+        km_title  = km.get("title", ticker)
         km_tokens = _title_tokens(km_title)
 
-        # Find the sportsbook event that best matches this Kalshi title.
+        # Find the sportsbook event that best matches this Kalshi market.
         best_ref, best_score = None, 0
         for ref in sharp_refs:
             s = _match_score(km_title, km_tokens, ref)
@@ -794,82 +940,101 @@ def find_kalshi_ev_bets(
                 best_ref = ref
 
         if best_ref is None or best_score == 0:
+            unmatched += 1
             continue
 
-        matched += 1
-        # Skip live bets (game already started).
+        # Skip live bets.
         try:
             ct = datetime.fromisoformat(best_ref["commence_time"].replace("Z", "+00:00"))
             if ct <= now:
                 continue
         except Exception:
-            continue  # can't verify pre-game — skip to be safe
-
-        fair = best_ref["fair"]
-        sharp_title = best_ref["sharp_title"]
-        commence_time = best_ref["commence_time"]
-
-        # Map YES to the matching team outcome.
-        yes_team, yes_fair = _map_yes_to_team(km_title, km_tokens, fair)
-        if yes_team is None:
             continue
 
-        no_fair = 1.0 - yes_fair  # binary market
+        matched += 1
+        sharp_title   = best_ref["sharp_title"]
+        commence_time = best_ref["commence_time"]
 
-        # Effective decimal odds including Kalshi fee
-        c_yes = yes_ask / 100
-        c_no  = no_ask  / 100
-        yes_dec = (1 - KALSHI_FEE_COEF * c_yes * (1 - c_yes)) / c_yes
-        no_dec  = (1 - KALSHI_FEE_COEF * c_no  * (1 - c_no )) / c_no
+        # Determine the Kalshi market type and look up the corresponding fair prob.
+        mkt_meta = _parse_kalshi_mkt(km_title)
 
-        yes_ev = yes_fair * yes_dec - 1
-        no_ev  = no_fair  * no_dec  - 1
+        # ── TOTAL market ──────────────────────────────────────────────────────
+        if mkt_meta and mkt_meta["type"] == "total":
+            pt   = mkt_meta["point"]
+            side = mkt_meta["side"]       # "over" or "under"
+            opp  = "under" if side == "over" else "over"
+            yes_fair = best_ref["fair_totals"].get((pt, side))
+            no_fair  = best_ref["fair_totals"].get((pt, opp))
+            if yes_fair is None and no_fair is None:
+                continue
+            if yes_fair is None and no_fair is not None:
+                yes_fair = 1.0 - no_fair
+            if no_fair is None and yes_fair is not None:
+                no_fair = 1.0 - yes_fair
+            for s, ask, fp, lbl in [("yes", yes_ask, yes_fair, f"YES — {side.title()} {pt}"),
+                                     ("no",  no_ask,  no_fair,  f"NO  — {opp.title()} {pt}")]:
+                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time)
+                if bet:
+                    results.append(bet)
 
-        if yes_ev > 0:
-            results.append(PlusEVBet(
-                event_name=km_title,
-                sport="prediction_market",
-                commence_time=commence_time,
-                leg=Leg(
-                    book="Kalshi",
-                    outcome=f"YES — {yes_team}",
-                    decimal_odds=round(yes_dec, 4),
-                    american_odds=decimal_to_american(yes_dec),
-                    implied_prob=implied_prob(yes_dec),
-                    market_url=f"https://kalshi.com/markets/{ticker}",
-                ),
-                sharp_prob=round(yes_fair, 4),
-                ev_pct=round(yes_ev * 100, 4),
-                sharp_book=sharp_title,
-                kalshi_ticker=ticker,
-                kalshi_side="yes",
-                kalshi_ask_cents=yes_ask,
-            ))
+        # ── SPREAD market ─────────────────────────────────────────────────────
+        elif mkt_meta and mkt_meta["type"] == "spread":
+            pt        = mkt_meta["point"]   # Kalshi always states a positive number
+            team_hint = mkt_meta["team"]    # lowercase partial team name from title
+            # Find the full team name in the sharp spreads that matches the hint
+            # and has this exact point value (negative = favourite covers).
+            yes_team = no_team = None
+            yes_fair = no_fair = None
+            for (sbook_team, sbook_pt), fp in best_ref["fair_spreads"].items():
+                team_lower = sbook_team.lower()
+                # "boston" hint matches "Boston Celtics"
+                last_word = sbook_team.split()[-1].lower() if sbook_team else ""
+                if (team_hint in team_lower or last_word in team_hint or team_hint in last_word):
+                    if abs(abs(sbook_pt) - pt) < 0.26:  # same line (allow 0.25 rounding)
+                        yes_fair = fp
+                        yes_team = sbook_team
+                        # NO = the other team covering at +pt
+                        opp_key = next(
+                            ((t, p) for (t, p), _ in best_ref["fair_spreads"].items()
+                             if t != sbook_team and abs(abs(p) - pt) < 0.26),
+                            None,
+                        )
+                        if opp_key:
+                            no_fair = best_ref["fair_spreads"][opp_key]
+                            no_team = opp_key[0]
+                        else:
+                            no_fair = 1.0 - yes_fair
+                            no_team = "Opp"
+                        break
+            if yes_fair is None:
+                continue
+            for s, ask, fp, lbl in [
+                ("yes", yes_ask, yes_fair, f"YES — {yes_team} by >{pt}"),
+                ("no",  no_ask,  no_fair,  f"NO  — {no_team} covers +{pt}"),
+            ]:
+                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time)
+                if bet:
+                    results.append(bet)
 
-        if no_ev > 0:
-            no_team = next((n for n in fair if n != yes_team), "NO")
-            results.append(PlusEVBet(
-                event_name=km_title,
-                sport="prediction_market",
-                commence_time=commence_time,
-                leg=Leg(
-                    book="Kalshi",
-                    outcome=f"NO — {no_team}",
-                    decimal_odds=round(no_dec, 4),
-                    american_odds=decimal_to_american(no_dec),
-                    implied_prob=implied_prob(no_dec),
-                    market_url=f"https://kalshi.com/markets/{ticker}",
-                ),
-                sharp_prob=round(no_fair, 4),
-                ev_pct=round(no_ev * 100, 4),
-                sharp_book=sharp_title,
-                kalshi_ticker=ticker,
-                kalshi_side="no",
-                kalshi_ask_cents=no_ask,
-            ))
+        # ── MONEYLINE (or unrecognized type) ──────────────────────────────────
+        else:
+            fair_h2h = best_ref["fair_h2h"]
+            if not fair_h2h:
+                continue
+            yes_team, yes_fair = _map_yes_to_team(km_title, km_tokens, fair_h2h)
+            if yes_team is None:
+                continue
+            no_fair = 1.0 - yes_fair
+            no_team = next((n for n in fair_h2h if n != yes_team), "Opp")
+            for s, ask, fp, lbl in [
+                ("yes", yes_ask, yes_fair, f"YES — {yes_team}"),
+                ("no",  no_ask,  no_fair,  f"NO  — {no_team}"),
+            ]:
+                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time)
+                if bet:
+                    results.append(bet)
 
-    if sharp_refs:
-        print(f"  [kalshi-ev] matched {matched}/{len(kalshi_raw)} markets to sharp refs → {len(results)} +EV bets")
+    print(f"  [kalshi-ev] {matched} matched / {unmatched} unmatched → {len(results)} +EV bets")
     return results
 
 
