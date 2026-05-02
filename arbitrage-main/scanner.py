@@ -1252,14 +1252,21 @@ class ScanResult:
         return sorted(self.opportunities, key=lambda o: o.edge_pct, reverse=True)
 
     def to_json(self) -> str:
+        import math
+        def _clean(v):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return 0.0
+            return v
+        def _clean_dict(d):
+            return {k: _clean(v) if isinstance(v, float) else v for k, v in d.items()}
         return json.dumps({
             "scan_time": self.scan_time,
             "arb_count": self.arb_count,
             "total_scanned": self.total_scanned,
-            "best_edge": self.best_edge,
+            "best_edge": _clean(self.best_edge),
             "errors": self.errors,
-            "opportunities": [o.to_dict() for o in self.sorted_by_edge()],
-            "ev_bets": [b.to_dict() for b in sorted(self.ev_bets, key=lambda b: b.ev_pct, reverse=True)],
+            "opportunities": [_clean_dict(o.to_dict()) for o in self.sorted_by_edge()],
+            "ev_bets": [_clean_dict(b.to_dict()) for b in sorted(self.ev_bets, key=lambda b: b.ev_pct, reverse=True)],
         }, indent=2)
 
 

@@ -152,7 +152,13 @@ async def auto_trade_kalshi(result: ScanResult) -> None:
 async def broadcast(result: ScanResult):
     global last_result
     last_result = result
-    payload = result.to_json()
+    try:
+        payload = result.to_json()
+    except Exception as e:
+        print(f"[server] ERROR serializing scan result to JSON: {e}")
+        import traceback; traceback.print_exc()
+        return
+    print(f"[server] Broadcasting to {len(ws_clients)} client(s): {result.total_scanned} markets, {result.arb_count} arbs, {len(result.ev_bets)} EV bets")
     dead = []
     for ws in ws_clients:
         try:
@@ -237,12 +243,17 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     ws_clients.append(websocket)
     if last_result:
-        await websocket.send_text(last_result.to_json())
+        try:
+            await websocket.send_text(last_result.to_json())
+        except Exception as e:
+            print(f"[server] ERROR sending cached result to new WebSocket client: {e}")
+            import traceback; traceback.print_exc()
     try:
         while True:
             await websocket.receive_text()  # keep alive
     except WebSocketDisconnect:
-        ws_clients.remove(websocket)
+        if websocket in ws_clients:
+            ws_clients.remove(websocket)
 
 @app.get("/sports")
 async def list_sports():
