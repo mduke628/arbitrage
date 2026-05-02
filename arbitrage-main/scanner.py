@@ -310,8 +310,9 @@ def _avg_sharp_fair(bookmakers: list[dict]) -> tuple[dict[str, float], dict[str,
                 names, probs = zip(*raw_pairs)
                 fair_list = _devig_probs(list(probs))
                 for n, r, f in zip(names, probs, fair_list):
-                    all_raw.setdefault(n, []).append(r)
-                    all_fair.setdefault(n, []).append(f)
+                    key = n.lower()  # M6: normalize case for cross-book averaging
+                    all_raw.setdefault(key, []).append(r)
+                    all_fair.setdefault(key, []).append(f)
                 titles_seen.append(bm["title"])
                 break  # one h2h market per book is enough
 
@@ -353,7 +354,7 @@ def _avg_sharp_spreads(bookmakers: list[dict]) -> dict[tuple[str, float], float]
                 names, points, probs = zip(*pairs)
                 fair_list = _devig_probs(list(probs))
                 for n, p, f in zip(names, points, fair_list):
-                    all_data.setdefault((n, float(p)), []).append(f)
+                    all_data.setdefault((n.lower(), float(p)), []).append(f)  # M6: normalize case
     return {k: sum(vs) / len(vs) for k, vs in all_data.items()}
 
 
@@ -831,13 +832,13 @@ def _parse_kalshi_mkt(title: str) -> Optional[dict]:
         if m:
             return {"type": "spread", "team": m.group(1).strip().lower(), "point": float(m.group(2))}
 
-    for pat in _TOTAL_PATTERNS:
+    for i, pat in enumerate(_TOTAL_PATTERNS):
         m = pat.match(title)
         if m:
-            if pat.pattern.startswith(r'^(over|under)'):
-                return {"type": "total", "side": m.group(1).lower(), "point": float(m.group(2))}
-            else:  # "more than X"
+            if i == 3:  # "more than X total points" — group(1) is the number
                 return {"type": "total", "side": "over", "point": float(m.group(1))}
+            else:  # patterns 0-2: group(1)=side, group(2)=number
+                return {"type": "total", "side": m.group(1).lower(), "point": float(m.group(2))}
 
     for pat in _TEAM_TOTAL_PATTERNS:
         m = pat.match(title)
@@ -1054,6 +1055,12 @@ def find_kalshi_ev_bets(
                                    auto_trade=exact)
                 if bet:
                     results.append(bet)
+
+        # ── TEAM TOTAL market ─────────────────────────────────────────────────
+        # No sharp team-total reference exists in the Odds API response, so we
+        # cannot compute a fair probability. Skip rather than misuse h2h data.
+        elif mkt_meta and mkt_meta["type"] == "team_total":
+            continue
 
         # ── MONEYLINE (or unrecognized type) ──────────────────────────────────
         else:

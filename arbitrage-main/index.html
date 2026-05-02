@@ -774,8 +774,6 @@ function renderEV() {
     const sport = (b.sport || '').replace(/_/g,' ').replace('americanfootball','football');
     const date = b.commence_time ? new Date(b.commence_time).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
     const evStr = '+' + b.ev_pct.toFixed(2) + '%';
-    const evStake = b._maxBet || bankroll;
-    const evDollars = (b.ev_pct / 100 * evStake).toFixed(2);
 
     // Kelly criterion: f = EV / (decimal_odds - 1)  [fraction of bankroll]
     const netOdds = b.leg.decimal_odds - 1;
@@ -784,6 +782,10 @@ function renderEV() {
     const kellyQuarterPct = (kellyQuarter * 100).toFixed(2);
     const kellyFullPct = (kellyFull * 100).toFixed(2);
     const kellyDollars = (kellyQuarter * bankroll).toFixed(2);
+
+    // EV chip uses 25% Kelly stake, not full bankroll (N5 fix)
+    const evStake = b._maxBet || parseFloat(kellyDollars);
+    const evDollars = (b.ev_pct / 100 * evStake).toFixed(2);
 
     const rawPct = b.sharp_raw_prob ? (b.sharp_raw_prob * 100).toFixed(1) + '%' : '';
     const fairPct = (b.sharp_prob * 100).toFixed(1) + '%';
@@ -820,7 +822,7 @@ function renderEV() {
           </div>
         </div>
         <div class="ev-bar">
-          <span class="pb-label">Avg expected profit per $${evStake.toFixed(0)} bet${b._maxBet ? ' <span style="font-size:10px;color:var(--amber)">(max bet)</span>' : ''} · not guaranteed</span>
+          <span class="pb-label">Avg expected profit per $${evStake.toFixed(2)} Kelly bet${b._maxBet ? ' <span style="font-size:10px;color:var(--amber)">(max bet)</span>' : ''} · not guaranteed</span>
           <span class="pb-val">~+$${evDollars}</span>
         </div>
         <div class="kelly-bar">

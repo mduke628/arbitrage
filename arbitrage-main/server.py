@@ -40,8 +40,8 @@ from scanner import scan, run_loop, ScanResult, SPORTS, place_kalshi_order
 # ---------------------------------------------------------------------------
 
 class Config(BaseModel):
-    odds_api_key:     str   = os.getenv("ODDS_API_KEY",   "e4e92b78d437e818a1af0355704c4de9")
-    kalshi_api_key:   str   = os.getenv("KALSHI_API_KEY", "8b8ae9ee-a48d-4da8-ab18-f9a32d8c990e")
+    odds_api_key:     str   = os.getenv("ODDS_API_KEY",   "")
+    kalshi_api_key:   str   = os.getenv("KALSHI_API_KEY", "")
     interval_seconds: int   = int(os.getenv("SCAN_INTERVAL", "60"))
     min_edge:         float = float(os.getenv("MIN_EDGE", "0.0"))
     arbs_only:        bool  = False
@@ -118,7 +118,7 @@ async def auto_trade_kalshi(result: ScanResult) -> None:
                 "limit_cents": bet.kalshi_ask_cents,
                 "ev_pct": bet.ev_pct,
                 "kelly_pct": round(kelly_quarter * 100, 2),
-                "stake_usd": round(stake, 2),
+                "stake_usd": round(count * bet.kalshi_ask_cents / 100, 2),
                 "event": bet.event_name,
                 "http_status": resp.get("http_status"),
                 "success": resp.get("http_status") == 201,
