@@ -36,7 +36,7 @@ try:
 except ImportError:
     print("[server] python-dotenv not installed — reading keys from OS environment only")
 
-from scanner import scan, run_loop, ScanResult, SPORTS, place_kalshi_order
+from scanner import scan, run_loop, ScanResult, SPORTS, place_kalshi_order, get_kalshi_market_result
 
 # ---------------------------------------------------------------------------
 # Config (loaded from env or set via /config)
@@ -65,10 +65,34 @@ print(f"[server] KALSHI_API_TOKEN: {'SET (' + str(len(config.kalshi_api_token)) 
 last_result: ScanResult | None = None
 ws_clients: list[WebSocket] = []
 
-# Tracks (ticker, side) pairs already ordered this session to avoid duplicates.
+# Tracks (ticker, side) pairs already ordered to avoid duplicates (persisted via trade_log).
 placed_orders: set[tuple[str, str]] = set()
-# Last 50 auto-trade actions for the /trade-log endpoint.
-trade_log: list[dict] = []
+
+# ---------------------------------------------------------------------------
+# Persistent trade log
+# ---------------------------------------------------------------------------
+TRADE_LOG_FILE = Path(__file__).parent / "trade_log.json"
+
+def _load_trade_log() -> list[dict]:
+    if TRADE_LOG_FILE.exists():
+        try:
+            entries = json.loads(TRADE_LOG_FILE.read_text(encoding="utf-8"))
+            # Rebuild placed_orders from successful past trades so we don't re-enter
+            for e in entries:
+                if e.get("success") and e.get("ticker") and e.get("side"):
+                    placed_orders.add((e["ticker"], e["side"]))
+            return entries
+        except Exception:
+            pass
+    return []
+
+def _save_trade_log(log: list[dict]) -> None:
+    try:
+        TRADE_LOG_FILE.write_text(json.dumps(log, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[trade-log] WARNING: could not save trade_log.json: {e}")
+
+trade_log: list[dict] = _load_trade_log()
 
 # ---------------------------------------------------------------------------
 # Kalshi auto-trading
@@ -121,6 +145,7 @@ async def auto_trade_kalshi(result: ScanResult) -> None:
                 bet.kalshi_ask_cents,
             )
 
+            success = resp.get("http_status") == 201
             entry = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "ticker": bet.kalshi_ticker,
@@ -131,17 +156,22 @@ async def auto_trade_kalshi(result: ScanResult) -> None:
                 "kelly_pct": round(kelly_quarter * 100, 2),
                 "stake_usd": round(count * bet.kalshi_ask_cents / 100, 2),
                 "event": bet.event_name,
+                "sport": bet.sport,
+                "order_id": resp.get("order_id", ""),
                 "http_status": resp.get("http_status"),
-                "success": resp.get("http_status") == 201,
+                "success": success,
                 "error": resp.get("error"),
+                # Settlement fields — filled in by the settlement poller
+                "settled": False,
+                "result": None,   # "win" | "loss"
+                "pnl": None,
             }
             trade_log.insert(0, entry)
-            if len(trade_log) > 50:
-                trade_log.pop()
+            _save_trade_log(trade_log)
 
-            if resp.get("http_status") == 201:
+            if success:
                 placed_orders.add((bet.kalshi_ticker, bet.kalshi_side))
-                print(f"[auto-trade] ✓ order placed for {bet.kalshi_ticker}")
+                print(f"[auto-trade] ✓ order placed for {bet.kalshi_ticker} (order_id={entry['order_id']})")
             else:
                 print(f"[auto-trade] ✗ failed: {resp}")
 
@@ -184,11 +214,46 @@ async def background_loop():
                 print(f"[server] scan error: {e}")
         await asyncio.sleep(config.interval_seconds)
 
+async def settlement_loop():
+    """
+    Every 10 minutes check all unsettled trades.
+    Queries Kalshi for each market's result and updates W/L + PnL.
+    """
+    while True:
+        await asyncio.sleep(600)
+        unsettled = [e for e in trade_log if e.get("success") and not e.get("settled")]
+        if not unsettled or not config.kalshi_api_key:
+            continue
+        async with aiohttp.ClientSession() as session:
+            changed = False
+            for entry in unsettled:
+                ticker = entry.get("ticker", "")
+                if not ticker:
+                    continue
+                market_result = await get_kalshi_market_result(session, config.kalshi_api_key, ticker)
+                if market_result is None:
+                    continue  # still open
+                won = (market_result == entry.get("side", "").lower())
+                c   = entry["limit_cents"] / 100
+                if won:
+                    # Net profit per contract = (1-c) × (1 - 0.07×c)
+                    pnl = round(entry["count"] * (1 - c) * (1 - 0.07 * c), 2)
+                else:
+                    pnl = round(-entry["count"] * c, 2)
+                entry["settled"] = True
+                entry["result"]  = "win" if won else "loss"
+                entry["pnl"]     = pnl
+                changed = True
+                print(f"[settlement] {ticker} {entry['side'].upper()} → "
+                      f"{'WIN' if won else 'LOSS'}  PnL=${pnl:+.2f}")
+            if changed:
+                _save_trade_log(trade_log)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(background_loop())
+    asyncio.create_task(background_loop())
+    asyncio.create_task(settlement_loop())
     yield
-    task.cancel()
 
 # ---------------------------------------------------------------------------
 # App
@@ -236,7 +301,38 @@ async def update_config(new_cfg: Config):
 
 @app.get("/trade-log")
 async def get_trade_log():
-    return {"trades": trade_log, "auto_trade_enabled": config.auto_trade}
+    settled = [e for e in trade_log if e.get("settled")]
+    total_pnl   = round(sum(e["pnl"] for e in settled if e["pnl"] is not None), 2)
+    wins        = sum(1 for e in settled if e.get("result") == "win")
+    losses      = sum(1 for e in settled if e.get("result") == "loss")
+
+    # PnL by sport
+    by_sport: dict[str, float] = {}
+    for e in settled:
+        s = e.get("sport") or "unknown"
+        by_sport[s] = round(by_sport.get(s, 0) + (e["pnl"] or 0), 2)
+
+    # PnL bucketed by EV range
+    by_ev: dict[str, float] = {}
+    for e in settled:
+        ev = e.get("ev_pct", 0)
+        bucket = f"{int(ev // 5) * 5}-{int(ev // 5) * 5 + 5}%"
+        by_ev[bucket] = round(by_ev.get(bucket, 0) + (e["pnl"] or 0), 2)
+
+    return {
+        "auto_trade_enabled": config.auto_trade,
+        "summary": {
+            "total_trades": len([e for e in trade_log if e.get("success")]),
+            "settled": len(settled),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / len(settled) * 100, 1) if settled else None,
+            "total_pnl": total_pnl,
+            "pnl_by_sport": by_sport,
+            "pnl_by_ev_bucket": by_ev,
+        },
+        "trades": trade_log,
+    }
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

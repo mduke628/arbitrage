@@ -1189,7 +1189,7 @@ async def place_kalshi_order(
     count: int,         # number of contracts
     limit_cents: int,   # limit price in cents (max you'll pay per contract)
 ) -> dict:
-    """Place a limit buy order on Kalshi. Returns {"http_status": code, ...}."""
+    """Place a limit buy order on Kalshi. Returns {"http_status": code, "order_id": ..., ...}."""
     path = "/trade-api/v2/portfolio/orders"
     client_id = f"autobet-{ticker[:20]}-{side}-{uuid.uuid4().hex[:8]}"
     yes_price = limit_cents if side == "yes" else (100 - limit_cents)
@@ -1210,7 +1210,10 @@ async def place_kalshi_order(
     async def _post(hdrs: dict) -> dict:
         async with session.post(url, headers=hdrs, json=body,
                                 timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            return {"http_status": resp.status, "order": await resp.json()}
+            data = await resp.json()
+            order_id = (data.get("order") or {}).get("order_id") or \
+                       (data.get("order") or {}).get("id") or ""
+            return {"http_status": resp.status, "order_id": order_id, "order": data}
 
     try:
         result = await _post(_kalshi_headers("POST", path, api_key))
@@ -1219,7 +1222,25 @@ async def place_kalshi_order(
             result = await _post(_kalshi_bearer_headers(api_key))
         return result
     except Exception as e:
-        return {"http_status": 0, "error": str(e)}
+        return {"http_status": 0, "order_id": "", "error": str(e)}
+
+
+async def get_kalshi_market_result(
+    session: aiohttp.ClientSession, api_key: str, ticker: str
+) -> Optional[str]:
+    """
+    Return the settled result for a Kalshi market: "yes", "no", or None if
+    the market is still open / not yet resolved.
+    """
+    path = f"/trade-api/v2/markets/{ticker}"
+    url  = f"{KALSHI_BASE}/markets/{ticker}"
+    try:
+        data = await _kalshi_get(session, url, path, api_key)
+        market = data.get("market") or data
+        result = str(market.get("result") or "").lower().strip()
+        return result if result in ("yes", "no") else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
