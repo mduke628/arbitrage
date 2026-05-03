@@ -235,6 +235,42 @@ SPORTS = [
     "darts_betway_premier_league",
 ]
 
+# Focused list of sports Kalshi actually offers markets on.
+# Used as the default scan list to keep each scan fast (~15 requests vs 83).
+KALSHI_SPORTS = [
+    # American football
+    "americanfootball_nfl",
+    "americanfootball_ncaaf",
+    # Basketball
+    "basketball_nba",
+    "basketball_ncaab",
+    "basketball_wnba",
+    # Baseball
+    "baseball_mlb",
+    # Ice Hockey
+    "icehockey_nhl",
+    # Soccer
+    "soccer_epl",
+    "soccer_uefa_champs_league",
+    "soccer_usa_mls",
+    "soccer_germany_bundesliga",
+    "soccer_spain_la_liga",
+    # Combat sports
+    "mma_mixed_martial_arts",
+    "boxing_boxing",
+    # Golf
+    "golf_pga_tour",
+    # Tennis
+    "tennis_atp_us_open",
+    "tennis_wta_us_open",
+    "tennis_atp_wimbledon",
+    "tennis_wta_wimbledon",
+    "tennis_atp_french_open",
+    "tennis_wta_french_open",
+    "tennis_atp_australian_open",
+    "tennis_wta_australian_open",
+]
+
 
 # ---------------------------------------------------------------------------
 # +EV detection
@@ -1340,11 +1376,10 @@ async def scan(
     errors: list[str] = []
 
     async with aiohttp.ClientSession() as session:
-        # Resolve sport list — fetch all active sports from API when none specified
-        if not sports and odds_api_key:
-            sports = await fetch_all_active_sports(session, odds_api_key)
-        elif not sports:
-            sports = SPORTS
+        # Use focused sports list — only the leagues Kalshi actually covers.
+        # Fetching all 83 active sports wastes quota and slows every scan.
+        if not sports:
+            sports = KALSHI_SPORTS
 
         tasks = []
 
