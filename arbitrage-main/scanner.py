@@ -1352,18 +1352,20 @@ async def scan(
             for sport in sports:
                 tasks.append(fetch_sport_odds(session, odds_api_key, sport))
 
-        kalshi_raw_task = None
+        # Launch Kalshi as a concurrent asyncio task so it runs in parallel with
+        # the sportsbook requests rather than sequentially after them.
+        kalshi_task = None
         if kalshi_api_key:
-            kalshi_raw_task = fetch_kalshi_raw(session, kalshi_api_key)
+            kalshi_task = asyncio.create_task(fetch_kalshi_raw(session, kalshi_api_key))
 
-        print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_raw_task else '0 Kalshi'} requests...")
+        print(f"[scanner] Launching {len(tasks)} sportsbook + {'1 Kalshi' if kalshi_task else '0 Kalshi'} requests in parallel...")
         t0 = time.time()
 
         sb_results_raw = await asyncio.gather(*tasks, return_exceptions=True)
         kalshi_raw_markets: list[dict] = []
-        if kalshi_raw_task:
+        if kalshi_task:
             try:
-                kalshi_raw_markets = await kalshi_raw_task
+                kalshi_raw_markets = await kalshi_task
             except Exception as e:
                 errors.append(f"Kalshi: {e}")
 

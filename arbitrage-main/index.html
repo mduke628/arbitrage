@@ -315,6 +315,19 @@ let allEVBets = [];
 let currentTab = 'arb';
 let nextScan = 0;
 let countdownTimer = null;
+let lastDataTs = 0;  // timestamp of last successful data receipt
+
+// Poll /status every 15s as a fallback when WebSocket hasn't delivered data
+setInterval(async () => {
+  if (Date.now() - lastDataTs < 20000) return; // WS is working fine
+  const base = document.getElementById('serverUrl').value.replace(/\/$/, '');
+  try {
+    const res = await fetch(base + '/status');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.total_scanned != null) { ingestResult(data); }
+  } catch(e) {}
+}, 15000);
 
 function log(msg, type='') {
   const box = document.getElementById('logBox');
@@ -409,6 +422,7 @@ async function refreshTradeLog() {
 }
 
 function ingestResult(data) {
+  lastDataTs = Date.now();
   allOpps = (data.opportunities || []);
   allEVBets = (data.ev_bets || []);
   document.getElementById('sMarkets').textContent = data.total_scanned ?? '—';
