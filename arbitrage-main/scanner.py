@@ -1400,8 +1400,12 @@ async def scan(
         kalshi_raw_markets: list[dict] = []
         if kalshi_task:
             try:
-                kalshi_raw_markets = await kalshi_task
+                kalshi_raw_markets = await asyncio.wait_for(kalshi_task, timeout=25)
+            except asyncio.TimeoutError:
+                print("[kalshi] fetch timed out after 25s — proceeding without Kalshi data")
+                kalshi_task.cancel()
             except Exception as e:
+                print(f"[kalshi] error: {e}")
                 errors.append(f"Kalshi: {e}")
 
         kalshi_opps = parse_kalshi_markets(kalshi_raw_markets)
@@ -1436,7 +1440,7 @@ async def scan(
             print(f"  [cross-market] {len(cross)} potential cross-market arbs found")
 
         elapsed = round(time.time() - t0, 2)
-        print(f"[scanner] Done in {elapsed}s — {len(all_opps)} markets analyzed")
+        print(f"[scanner] ✓ Done in {elapsed}s — {len(all_opps)} opps, {len(ev_bets)} EV bets, {len(errors)} errors")
 
     if arbs_only:
         all_opps = [o for o in all_opps if o.is_arb]
