@@ -371,11 +371,12 @@ def _avg_sharp_fair(bookmakers: list[dict]) -> tuple[dict[str, float], dict[str,
     fair = {n: sum(ps) / len(ps) for n, ps in all_fair.items()}
     raw  = {n: sum(ps) / len(ps) for n, ps in all_raw.items()}
     n_books = len(set(titles_seen))
+    n_total = len(SHARP_BOOKS)
     unique_titles = list(dict.fromkeys(titles_seen))
     if n_books > 1:
-        label = f"Avg({', '.join(unique_titles)})"
+        label = f"Avg({', '.join(unique_titles)})  [{n_books}/{n_total} sharp books]"
     else:
-        label = unique_titles[0]
+        label = f"{unique_titles[0]}  [{n_books}/{n_total} sharp books]"
     return fair, raw, label
 
 
@@ -1088,6 +1089,13 @@ def find_kalshi_ev_bets(
             continue
 
         km_title  = km.get("title", ticker)
+
+        # Skip multi-game conditional/parlay markets. Kalshi titles for these
+        # start with "yes <team>, no <team>, ..." and span multiple games.
+        # Matching them to a single sportsbook event produces wildly wrong EV.
+        if "," in km_title and re.match(r"^(yes|no)\s+\S", km_title, re.I):
+            continue
+
         km_tokens = _title_tokens(km_title)
 
         # Find the sportsbook event that best matches this Kalshi market.
