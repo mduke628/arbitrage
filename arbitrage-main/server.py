@@ -112,6 +112,7 @@ async def auto_trade_kalshi(result: ScanResult) -> None:
         if b.ev_pct >= config.ev_threshold
         and b.kalshi_ticker
         and b.kalshi_side
+        and not b.is_live          # never auto-trade in-progress games
         and (b.kalshi_ticker, b.kalshi_side) not in placed_orders
     ]
     if not qualifying:

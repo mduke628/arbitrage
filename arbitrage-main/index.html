@@ -836,7 +836,8 @@ function renderEV() {
         <span class="edge-badge pos">${evStr}</span>
         <span class="opp-name">${b.event_name} · ${b.leg.outcome}${b._boosted ? ' <span style="font-size:10px;color:var(--amber)">⚡</span>' : ''}</span>
         <span class="sport-tag">${sport}</span>
-        <span class="source-tag sportsbook">+EV</span>
+        ${b.is_live ? '<span style="font-size:10px;background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.35);border-radius:4px;padding:2px 6px">LIVE</span>' : ''}
+        <span class="source-tag sportsbook">${b.ev_pct >= 0 ? '+EV' : '-EV'}</span>
         ${b.kalshi_ticker && document.getElementById('autoTrade').checked ? '<span style="font-size:10px;background:rgba(99,102,241,.2);color:#818cf8;border-radius:4px;padding:2px 6px;margin-left:4px">⚡ auto-trade</span>' : ''}
         <span class="ev-chip">~+$${evDollars}/bet</span>
         <span class="chevron" id="evc${i}">›</span>

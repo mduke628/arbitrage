@@ -314,12 +314,14 @@ class PlusEVBet:
     kalshi_ticker: str = ""       # Kalshi market ticker; set for Kalshi auto-trade bets
     kalshi_side: str = ""         # "yes" or "no"
     kalshi_ask_cents: int = 0     # current ask price in cents for limit order
+    is_live: bool = False         # True if game has already started
 
     def to_dict(self) -> dict:
         return {
             "event_name": self.event_name,
             "sport": self.sport,
             "commence_time": self.commence_time,
+            "is_live": self.is_live,
             "leg": asdict(self.leg),
             "sharp_prob": self.sharp_prob,
             "sharp_raw_prob": self.sharp_raw_prob,
@@ -1049,17 +1051,20 @@ def find_kalshi_ev_bets(
     matched = unmatched = 0
 
     def _make_ev_bet(km, ticker, side, ask_cents, fair_p, outcome_label,
-                     sharp_title, commence_time, auto_trade=True) -> Optional[PlusEVBet]:
+                     sharp_title, commence_time, auto_trade=True,
+                     is_live=False) -> Optional[PlusEVBet]:
         c = ask_cents / 100
         dec = (1 - KALSHI_FEE_COEF * c * (1 - c)) / c
         ev = fair_p * dec - 1
-        if ev <= 0:
-            return None
+        # Include all matched bets (even negative EV) so the user can verify
+        # matching correctness. The UI "Min edge %" filter (default 0) hides
+        # negative-EV bets in normal use; lower it to see all matched markets.
         km_title = km.get("title", ticker)
         return PlusEVBet(
             event_name=km_title,
             sport="prediction_market",
             commence_time=commence_time,
+            is_live=is_live,
             leg=Leg(
                 book="Kalshi",
                 outcome=outcome_label,
@@ -1113,17 +1118,23 @@ def find_kalshi_ev_bets(
             unmatched += 1
             continue
 
-        # Skip live bets.
-        try:
-            ct = datetime.fromisoformat(best_ref["commence_time"].replace("Z", "+00:00"))
-            if ct <= now:
-                continue
-        except Exception:
-            continue
-
         matched += 1
         sharp_title   = best_ref["sharp_title"]
         commence_time = best_ref["commence_time"]
+
+        # Determine whether the game is already live.
+        # Live bets are included in results (for UI verification) but excluded
+        # from auto-trading; the UI's "Hide live" checkbox controls display.
+        is_live = False
+        try:
+            ct = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+            is_live = ct <= now
+        except Exception:
+            pass
+
+        live_tag = "LIVE" if is_live else "pre-game"
+        print(f"  [kalshi-ev] {live_tag} match (score={best_score}): "
+              f"{km_title[:45]!r} → {best_ref['home']} vs {best_ref['away']}")
 
         # Determine the Kalshi market type and look up the corresponding fair prob.
         mkt_meta = _parse_kalshi_mkt(km_title)
@@ -1163,7 +1174,7 @@ def find_kalshi_ev_bets(
                 ("no",  no_ask,  no_fair,  f"NO  — {opp.title()} {pt}{ref_note}"),
             ]:
                 bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time,
-                                   auto_trade=exact)
+                                   auto_trade=exact, is_live=is_live)
                 if bet:
                     results.append(bet)
 
@@ -1218,7 +1229,7 @@ def find_kalshi_ev_bets(
                 ("no",  no_ask,  no_fair,  f"NO  — {no_team} covers +{pt}{ref_note}"),
             ]:
                 bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time,
-                                   auto_trade=exact)
+                                   auto_trade=exact, is_live=is_live)
                 if bet:
                     results.append(bet)
 
@@ -1242,7 +1253,8 @@ def find_kalshi_ev_bets(
                 ("yes", yes_ask, yes_fair, f"YES — {yes_team}"),
                 ("no",  no_ask,  no_fair,  f"NO  — {no_team}"),
             ]:
-                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time)
+                bet = _make_ev_bet(km, ticker, s, ask, fp, lbl, sharp_title, commence_time,
+                                   is_live=is_live)
                 if bet:
                     results.append(bet)
 
