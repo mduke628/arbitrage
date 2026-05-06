@@ -651,7 +651,10 @@ def parse_sportsbook_events(events: list[dict]) -> list[ArbOpportunity]:
 # ---------------------------------------------------------------------------
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_FEE_COEF = 0.07  # taker fee: $0.07 × C × (1−C) per $1 contract, where C = price in dollars
+# Maker fee applies to limit orders that rest and fill later (our execution model).
+# Formula from kalshi_fees.py: fee = 0.0175 × C × P × (1−P) per contract.
+# Taker fee (0.07) is used by kalshi_fees.py for market orders only.
+KALSHI_FEE_COEF = 0.0175
 
 
 def _kalshi_bearer_headers(api_key: str) -> dict:

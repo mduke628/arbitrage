@@ -236,11 +236,13 @@ async def settlement_loop():
                     continue  # still open
                 won = (market_result == entry.get("side", "").lower())
                 c   = entry["limit_cents"] / 100
+                fee = 0.0175 * c * (1 - c)  # maker fee per contract
                 if won:
-                    # Net profit per contract = (1-c) × (1 - 0.07×c)
-                    pnl = round(entry["count"] * (1 - c) * (1 - 0.07 * c), 2)
+                    # Receive $1 minus maker fee; net profit = (1 - fee) - c
+                    pnl = round(entry["count"] * (1 - c - fee), 2)
                 else:
-                    pnl = round(-entry["count"] * c, 2)
+                    # Lost the premium paid; also paid the entry fee
+                    pnl = round(-entry["count"] * (c + fee), 2)
                 entry["settled"] = True
                 entry["result"]  = "win" if won else "loss"
                 entry["pnl"]     = pnl
