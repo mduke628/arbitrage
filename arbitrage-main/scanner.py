@@ -723,16 +723,22 @@ async def _kalshi_get(
     return data
 
 
-async def fetch_kalshi_raw(session: aiohttp.ClientSession, api_key: str) -> list[dict]:
+async def fetch_kalshi_raw(session: aiohttp.ClientSession, api_key: str, max_seconds: float = 22.0) -> list[dict]:
     """
-    Fetch all open Kalshi markets, paginating via cursor.
-    Returns raw market dicts filtered to sports-like markets.
+    Fetch open Kalshi markets, paginating via cursor up to max_seconds.
+    Returns partial results if the time limit is reached — never returns empty
+    just because pagination is slow.
     """
     markets: list[dict] = []
     cursor: Optional[str] = None
     path = "/trade-api/v2/markets"
+    t_start = time.time()
 
     while True:
+        elapsed = time.time() - t_start
+        if elapsed >= max_seconds:
+            print(f"  [kalshi] time limit {max_seconds}s reached after {len(markets)} markets — using partial results")
+            break
         url = f"{KALSHI_BASE}/markets?limit=1000&status=open"
         if cursor:
             url += f"&cursor={cursor}"
@@ -751,7 +757,7 @@ async def fetch_kalshi_raw(session: aiohttp.ClientSession, api_key: str) -> list
 
     normalized = [_normalize_kalshi_market(m) for m in markets]
     sports_markets = [m for m in normalized if _looks_like_sports_market(m)]
-    print(f"  [kalshi] {len(markets)} open markets ({len(sports_markets)} sports-like)")
+    print(f"  [kalshi] {len(markets)} open markets ({len(sports_markets)} sports-like) in {time.time()-t_start:.1f}s")
     return sports_markets
 
 
@@ -1349,18 +1355,20 @@ class ScanResult:
         def _clean(v):
             if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
                 return 0.0
+            if isinstance(v, dict):
+                return {k: _clean(val) for k, val in v.items()}
+            if isinstance(v, list):
+                return [_clean(item) for item in v]
             return v
-        def _clean_dict(d):
-            return {k: _clean(v) if isinstance(v, float) else v for k, v in d.items()}
-        return json.dumps({
+        return json.dumps(_clean({
             "scan_time": self.scan_time,
             "arb_count": self.arb_count,
             "total_scanned": self.total_scanned,
-            "best_edge": _clean(self.best_edge),
+            "best_edge": self.best_edge,
             "errors": self.errors,
-            "opportunities": [_clean_dict(o.to_dict()) for o in self.sorted_by_edge()],
-            "ev_bets": [_clean_dict(b.to_dict()) for b in sorted(self.ev_bets, key=lambda b: b.ev_pct, reverse=True)],
-        }, indent=2)
+            "opportunities": [o.to_dict() for o in self.sorted_by_edge()],
+            "ev_bets": [b.to_dict() for b in sorted(self.ev_bets, key=lambda b: b.ev_pct, reverse=True)],
+        }), indent=2)
 
 
 async def scan(
@@ -1400,9 +1408,11 @@ async def scan(
         kalshi_raw_markets: list[dict] = []
         if kalshi_task:
             try:
-                kalshi_raw_markets = await asyncio.wait_for(kalshi_task, timeout=25)
+                # fetch_kalshi_raw has its own 22s internal limit and returns partial results.
+                # The outer wait_for(30s) is a hard backstop for network hangs.
+                kalshi_raw_markets = await asyncio.wait_for(kalshi_task, timeout=30)
             except asyncio.TimeoutError:
-                print("[kalshi] fetch timed out after 25s — proceeding without Kalshi data")
+                print("[kalshi] hard timeout after 30s — proceeding without Kalshi data")
                 kalshi_task.cancel()
             except Exception as e:
                 print(f"[kalshi] error: {e}")
@@ -1440,7 +1450,10 @@ async def scan(
             print(f"  [cross-market] {len(cross)} potential cross-market arbs found")
 
         elapsed = round(time.time() - t0, 2)
-        print(f"[scanner] ✓ Done in {elapsed}s — {len(all_opps)} opps, {len(ev_bets)} EV bets, {len(errors)} errors")
+        # total_scanned = all sportsbook events fetched + all Kalshi markets fetched
+        # (this reflects how much data was actually scanned, not just arbs found)
+        total_scanned = len(all_raw_events) + len(kalshi_raw_markets)
+        print(f"[scanner] ✓ Done in {elapsed}s — {total_scanned} events scanned, {len(ev_bets)} EV bets, {len(errors)} errors")
 
     if arbs_only:
         all_opps = [o for o in all_opps if o.is_arb]
@@ -1453,7 +1466,7 @@ async def scan(
     return ScanResult(
         opportunities=all_opps,
         arb_count=arb_count,
-        total_scanned=len(all_opps),
+        total_scanned=total_scanned,
         best_edge=round(best_edge, 4),
         books_seen=books_seen,
         scan_time=datetime.now(timezone.utc).isoformat(),

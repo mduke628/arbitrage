@@ -353,7 +353,13 @@ function connect() {
   log('Connecting to ' + wsUrl);
   try {
     ws = new WebSocket(wsUrl);
-    ws.onopen = () => { setStatus(true); log('Connected', 'ok'); };
+    ws.onopen = () => {
+      setStatus(true); log('Connected', 'ok');
+      // Immediately fetch any cached scan result so we don't wait for the next broadcast
+      fetch(base + '/status').then(r => r.ok ? r.json() : null).then(data => {
+        if (data && data.total_scanned != null) ingestResult(data);
+      }).catch(() => {});
+    };
     ws.onclose = () => {
       setStatus(false); ws = null;
       log('Disconnected — retrying in 5s...');
@@ -697,7 +703,12 @@ function render() {
 
   const list = document.getElementById('oppList');
   if (!filtered.length) {
-    list.innerHTML = `<div class="empty"><div class="empty-title">${allOpps.length ? 'No arbs found' : 'No data'}</div><div class="empty-sub">${allOpps.length ? 'No arbitrage opportunities at current settings. Try the +EV tab.' : 'Connect to the server and trigger a scan.'}</div></div>`;
+    const gotData = lastDataTs > 0;
+    const title = gotData ? 'No arbs found' : 'No data yet';
+    const sub   = gotData
+      ? 'No arbitrage opportunities match current filters. Try the +EV tab to see +EV Kalshi bets.'
+      : 'Start the Python server (<code>uvicorn server:app --reload --port 8000</code>), then click Connect.';
+    list.innerHTML = `<div class="empty"><div class="empty-title">${title}</div><div class="empty-sub">${sub}</div></div>`;
     return;
   }
 
@@ -775,7 +786,12 @@ function renderEV() {
 
   const list = document.getElementById('oppList');
   if (!filtered.length) {
-    list.innerHTML = `<div class="empty"><div class="empty-title">${allEVBets.length ? 'No matches' : 'No data'}</div><div class="empty-sub">${allEVBets.length ? 'Try lowering the min edge filter.' : 'Connect to the server and trigger a scan. +EV requires Pinnacle or Lowvig lines to be available.'}</div></div>`;
+    const gotData = lastDataTs > 0;
+    const title = gotData ? (allEVBets.length ? 'No matches' : 'No +EV bets found') : 'No data yet';
+    const sub   = gotData
+      ? (allEVBets.length ? 'Try lowering the min edge filter.' : 'No +EV Kalshi opportunities found this scan. Check Kalshi auth and private_key.pem.')
+      : 'Connect to the server and trigger a scan.';
+    list.innerHTML = `<div class="empty"><div class="empty-title">${title}</div><div class="empty-sub">${sub}</div></div>`;
     return;
   }
 
