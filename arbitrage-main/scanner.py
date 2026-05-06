@@ -878,6 +878,14 @@ _STOP_WORDS = {"the", "a", "an", "vs", "at", "in", "of", "to", "for",
                "under", "next", "be", "on", "by", "is", "are", "and",
                "not", "no", "yes", "beat", "defeat", "take", "series"}
 
+# Generic words that appear in many team names and must NOT be used as
+# discriminating identifiers. Using "city" to match "Kansas City" ↔ "Manchester City"
+# is the classic false-positive that this list prevents.
+_GENERIC_TEAM_WORDS = {
+    "city", "united", "fc", "sc", "athletic", "town", "county",
+    "real", "club", "red", "blue", "white", "black",
+}
+
 def _title_tokens(text: str) -> set[str]:
     return set(re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()) - _STOP_WORDS
 
@@ -887,9 +895,12 @@ def _match_score(km_title: str, km_tokens: set[str], ref: dict) -> int:
     Score how well a Kalshi market title matches a sportsbook event reference.
     Higher is better; 0 means no match.
     Uses substring matching on full team names AND token overlap on short names.
+    Generic words ("city", "united", "fc", …) are excluded from token overlap
+    to prevent false positives like "Kansas City" ↔ "Manchester City".
     """
     score = 0
     km_lower = km_title.lower()
+    km_useful = km_tokens - _GENERIC_TEAM_WORDS
     for team in (ref["home"], ref["away"]):
         if not team:
             continue
@@ -897,15 +908,17 @@ def _match_score(km_title: str, km_tokens: set[str], ref: dict) -> int:
         if team.lower() in km_lower:
             score += 6
             continue
-        # Last word of team name = mascot/city identifier (e.g. "Lakers")
+        # Last word of team name = mascot/city identifier (e.g. "Lakers", "Chiefs")
+        # Skip generic words that appear across many team names.
         parts = team.split()
         if parts:
             last = parts[-1].lower()
-            if len(last) > 3 and last in km_lower:
+            if len(last) > 3 and last not in _GENERIC_TEAM_WORDS and last in km_lower:
                 score += 3
                 continue
-        # Token overlap fallback
-        score += len(km_tokens & _title_tokens(team))
+        # Token overlap fallback — exclude generic words from both sides
+        team_useful = _title_tokens(team) - _GENERIC_TEAM_WORDS
+        score += len(km_useful & team_useful)
     return score
 
 
@@ -913,9 +926,11 @@ def _map_yes_to_team(km_title: str, km_tokens: set[str], fair: dict) -> tuple[Op
     """
     Determine which sportsbook outcome corresponds to Kalshi YES by scoring
     each outcome name against the market title. Returns (team_name, fair_prob).
+    Generic words are excluded from token overlap to avoid false team mapping.
     """
     km_lower = km_title.lower()
     best_team, best_fair, best_score = None, 0.0, -1
+    km_useful = km_tokens - _GENERIC_TEAM_WORDS
     for outcome_name, fair_p in fair.items():
         score = 0
         if outcome_name.lower() in km_lower:
@@ -924,9 +939,10 @@ def _map_yes_to_team(km_title: str, km_tokens: set[str], fair: dict) -> tuple[Op
             parts = outcome_name.split()
             if parts:
                 last = parts[-1].lower()
-                if len(last) > 3 and last in km_lower:
+                if len(last) > 3 and last not in _GENERIC_TEAM_WORDS and last in km_lower:
                     score += 3
-            score += len(km_tokens & _title_tokens(outcome_name))
+            team_useful = _title_tokens(outcome_name) - _GENERIC_TEAM_WORDS
+            score += len(km_useful & team_useful)
         if score > best_score:
             best_score = score
             best_team = outcome_name
@@ -1082,7 +1098,10 @@ def find_kalshi_ev_bets(
                 best_score = s
                 best_ref = ref
 
-        if best_ref is None or best_score == 0:
+        # Require score >= 2: at least two distinct non-generic tokens must match,
+        # or one high-confidence hit (full name = 6, distinctive last word = 3).
+        # Score of 1 means a single generic-ish token matched — too weak.
+        if best_ref is None or best_score < 2:
             unmatched += 1
             continue
 
